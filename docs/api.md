@@ -104,7 +104,43 @@ the event anchors a new standalone request, and `considered` records why.
 Evidence exposes fragment **kinds and hashes only, never raw values**, so no
 contact detail is revealed before consent is confirmed. Identity fragments
 brought by merged events accumulate on the request, letting later events
-match on them.
+match on them. After a contact erasure (below), matching also consults the
+non-reversible erased-fragment evidence; such matches carry
+`"redacted": true` and rationale like `phone(redacted) matched`, so a late
+event carrying the revoked phone still converges to the same chain without
+the database retaining the raw number.
+
+### Contact erasure on revocation
+
+Consent state and stored contact data are separate concerns. Effective
+consent always folds from the event chain (round 1). In addition, when a
+revocation removes the **last live `CONTACT_CALLBACK` grant** of a request,
+contact erasure fires inside the same transaction:
+
+- `person_json` loses `phone`/`email` (name and `idNumber` are not contact
+  channels and are kept);
+- live `phone`/`email` identity fragments move to
+  `erased_identity_evidence` — `{kind, fragmentHash, erasedByEvent,
+erasedAt}` — the legal, non-reversible proof of what was erased;
+- every stored payload copy on the chain gets its person `phone`/`email`
+  replaced by a `REDACTED#<fragmentHash>` marker;
+- `payload_hash` columns are **never** touched: replays still verify against
+  the original bytes.
+
+Only the revoked scope's data is erased — a `CASE_SUMMARY_TRANSFER` or
+`ACCOMMODATION_TRANSFER` revocation touches no contact data, and erasure
+never crosses into another chain. Repeated erasure is idempotent (evidence
+is `INSERT OR IGNORE`; a second revocation of an already-erased scope is an
+accepted no-op). After erasure:
+
+- later events **without** a fresh `CONTACT_CALLBACK` grant do not
+  re-register contact fields or fragments, and their stored payload copy is
+  redacted on arrival — a late retry carrying the revoked phone cannot
+  resurrect it;
+- a later event **with** a fresh `CONTACT_CALLBACK` grant is a new consent:
+  contact may be registered again from that event onward;
+- replays of pre-erasure events return their original stored results
+  (historical evidence) but never re-fold state.
 
 ### Per-record result
 
@@ -247,6 +283,16 @@ across reads.
   "accommodations": ["BRAILLE_MATERIAL"],
   "consentEffective": ["ACCOMMODATION_TRANSFER", "CONTACT_CALLBACK"],
   "consentRevoked": ["CASE_SUMMARY_TRANSFER"],
+  "callbackWindowMinutes": 45,
+  "callbackWindowKind": "SAME_DAY",
+  "erasedIdentities": [
+    {
+      "kind": "phone",
+      "fragmentHash": "9f2e…",
+      "erasedByEvent": "EV-H-100",
+      "erasedAt": "…"
+    }
+  ],
   "stateHash": "sha256-of-folded-state",
   "createdAt": "…",
   "updatedAt": "…"
@@ -254,7 +300,9 @@ across reads.
 ```
 
 `stateHash` pins the exact folded state so replays can be compared byte for
-byte.
+byte. `erasedIdentities` (present only after a contact erasure) is the
+non-reversible compliance evidence: which fragment kinds were purged, by
+which revocation event, and when — hashes only, never raw values.
 
 ### `GET /v1/requests/{requestId}/attempts` — every attempt
 
@@ -270,8 +318,8 @@ once the event exists.
 
 ## Transaction semantics (per record)
 
-1. **One record, one transaction.** Event insert, state fold and attempt log
-   commit or roll back together.
+1. **One record, one transaction.** Event insert, state fold, contact
+   erasure (when triggered) and attempt log commit or roll back together.
 2. **Exactly-once application.** An accepted event mutates state once. Same
    `eventId` + same payload (canonical JSON hash) returns the stored original
    result; same `eventId` + different payload returns 409 and changes nothing

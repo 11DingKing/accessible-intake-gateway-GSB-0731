@@ -62,6 +62,24 @@ CREATE TABLE IF NOT EXISTS request_identities (
 CREATE INDEX IF NOT EXISTS idx_request_identities_lookup ON request_identities(kind, value);
 `
 
+// erasureDDL is migration v3: revocation-driven contact erasure. The flag
+// marks requests whose contact data was purged; the evidence table keeps the
+// non-reversible hashes of erased fragments so matching still converges to
+// the same single chain without retaining raw values.
+const erasureDDL = `
+ALTER TABLE canonical_requests ADD COLUMN contact_erased INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS erased_identity_evidence (
+    request_id      TEXT NOT NULL REFERENCES canonical_requests(request_id),
+    kind            TEXT NOT NULL,
+    fragment_hash   TEXT NOT NULL,
+    erased_by_event TEXT NOT NULL,
+    erased_at       TEXT NOT NULL,
+    PRIMARY KEY (request_id, kind, fragment_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_erased_evidence_lookup ON erased_identity_evidence(kind, fragment_hash);
+`
+
 // migration is one ordered, recorded schema step.
 type migration struct {
 	version int
@@ -84,6 +102,7 @@ var migrations = []migration{
 		}
 		return backfillIdentities(ctx, db)
 	}},
+	{3, applySQL(erasureDDL)},
 }
 
 // backfillIdentities registers fragments for requests stored before v2.
@@ -187,13 +206,14 @@ func (s *Store) ExecOutsideTx(ctx context.Context, query string, args ...any) er
 
 // RequestRow is the persisted canonical request.
 type RequestRow struct {
-	RequestID  string
-	PersonKey  string
-	PersonJSON string
-	StateJSON  string
-	EventCount int
-	CreatedAt  string
-	UpdatedAt  string
+	RequestID     string
+	PersonKey     string
+	PersonJSON    string
+	StateJSON     string
+	EventCount    int
+	ContactErased bool
+	CreatedAt     string
+	UpdatedAt     string
 }
 
 // EventRow is one accepted event on a request's chain.
@@ -221,13 +241,15 @@ type AttemptRow struct {
 	AttemptedAt string
 }
 
-const requestCols = `request_id, person_key, person_json, state_json, event_count, created_at, updated_at`
+const requestCols = `request_id, person_key, person_json, state_json, event_count, contact_erased, created_at, updated_at`
 
 func scanRequest(row interface{ Scan(...any) error }) (*RequestRow, error) {
 	var r RequestRow
-	if err := row.Scan(&r.RequestID, &r.PersonKey, &r.PersonJSON, &r.StateJSON, &r.EventCount, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	var erased int
+	if err := row.Scan(&r.RequestID, &r.PersonKey, &r.PersonJSON, &r.StateJSON, &r.EventCount, &erased, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, err
 	}
+	r.ContactErased = erased != 0
 	return &r, nil
 }
 
@@ -260,8 +282,12 @@ func GetRequestByIDTx(ctx context.Context, tx *sql.Tx, requestID string) (*Reque
 // when another channel won the race on the same person key. Either way the
 // caller gets the single authoritative request row.
 func InsertRequestIfAbsentTx(ctx context.Context, tx *sql.Tx, r *RequestRow) (*RequestRow, bool, error) {
-	res, err := tx.ExecContext(ctx, `INSERT INTO canonical_requests (`+requestCols+`) VALUES (?,?,?,?,?,?,?) ON CONFLICT(person_key) DO NOTHING`,
-		r.RequestID, r.PersonKey, r.PersonJSON, r.StateJSON, r.EventCount, r.CreatedAt, r.UpdatedAt)
+	erased := 0
+	if r.ContactErased {
+		erased = 1
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO canonical_requests (`+requestCols+`) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(person_key) DO NOTHING`,
+		r.RequestID, r.PersonKey, r.PersonJSON, r.StateJSON, r.EventCount, erased, r.CreatedAt, r.UpdatedAt)
 	if err != nil {
 		return nil, false, err
 	}
@@ -370,24 +396,36 @@ func GetRequestByPersonKeyTx(ctx context.Context, tx *sql.Tx, personKey string) 
 }
 
 // FindCandidateRequestsTx returns requests sharing at least one identity
-// fragment with the event, in deterministic order (oldest first).
+// fragment with the event — live fragments or non-reversible erased evidence
+// alike — in deterministic order (oldest first).
 func FindCandidateRequestsTx(ctx context.Context, tx *sql.Tx, frags []fragment) ([]*RequestRow, error) {
 	if len(frags) == 0 {
 		return nil, nil
 	}
-	pairs := make([]string, 0, len(frags))
-	args := make([]any, 0, len(frags)*2)
+	cols := strings.Join([]string{
+		"request_id", "person_key", "person_json", "state_json", "event_count", "contact_erased", "created_at", "updated_at",
+	}, ", r.")
+	livePairs := make([]string, 0, len(frags))
+	evidencePairs := make([]string, 0, len(frags))
+	args := make([]any, 0, len(frags)*4)
 	for _, f := range frags {
-		pairs = append(pairs, "(?,?)")
+		livePairs = append(livePairs, "(?,?)")
 		args = append(args, f.Kind, f.Value)
 	}
-	query := `SELECT DISTINCT r.` + strings.Join([]string{
-		"request_id", "person_key", "person_json", "state_json", "event_count", "created_at", "updated_at",
-	}, ", r.") + `
+	for _, f := range frags {
+		evidencePairs = append(evidencePairs, "(?,?)")
+		args = append(args, f.Kind, fragmentHash(f.Kind, f.Value))
+	}
+	query := `SELECT DISTINCT r.` + cols + `
 		FROM canonical_requests r
 		JOIN request_identities i ON i.request_id = r.request_id
-		WHERE (i.kind, i.value) IN (` + strings.Join(pairs, ",") + `)
-		ORDER BY r.created_at, r.request_id`
+		WHERE (i.kind, i.value) IN (` + strings.Join(livePairs, ",") + `)
+		UNION
+		SELECT DISTINCT r.` + cols + `
+		FROM canonical_requests r
+		JOIN erased_identity_evidence e ON e.request_id = r.request_id
+		WHERE (e.kind, e.fragment_hash) IN (` + strings.Join(evidencePairs, ",") + `)
+		ORDER BY 7, 1` // created_at, request_id (positional for compound SELECT)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -437,5 +475,141 @@ func AddIdentitiesTx(ctx context.Context, tx *sql.Tx, requestID string, frags []
 // UpdateRequestPersonTx persists the accumulated person record.
 func UpdateRequestPersonTx(ctx context.Context, tx *sql.Tx, requestID, personJSON string) error {
 	_, err := tx.ExecContext(ctx, `UPDATE canonical_requests SET person_json = ? WHERE request_id = ?`, personJSON, requestID)
+	return err
+}
+
+// IdentityRow is one stored identity fragment with its hash.
+type IdentityRow struct {
+	Kind         string
+	Value        string
+	FragmentHash string
+}
+
+// ErasureRow is the non-reversible evidence of one erased fragment.
+type ErasureRow struct {
+	Kind          string
+	FragmentHash  string
+	ErasedByEvent string
+	ErasedAt      string
+}
+
+// ListIdentityRowsTx returns live fragments of the given kinds.
+func ListIdentityRowsTx(ctx context.Context, tx *sql.Tx, requestID string, kinds []string) ([]IdentityRow, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	marks := make([]string, 0, len(kinds))
+	args := []any{requestID}
+	for _, k := range kinds {
+		marks = append(marks, "?")
+		args = append(args, k)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT kind, value, fragment_hash FROM request_identities
+		WHERE request_id = ? AND kind IN (`+strings.Join(marks, ",")+`) ORDER BY kind, value`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IdentityRow
+	for rows.Next() {
+		var r IdentityRow
+		if err := rows.Scan(&r.Kind, &r.Value, &r.FragmentHash); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteIdentitiesTx removes live fragments of the given kinds (erasure).
+func DeleteIdentitiesTx(ctx context.Context, tx *sql.Tx, requestID string, kinds []string) error {
+	if len(kinds) == 0 {
+		return nil
+	}
+	marks := make([]string, 0, len(kinds))
+	args := []any{requestID}
+	for _, k := range kinds {
+		marks = append(marks, "?")
+		args = append(args, k)
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM request_identities WHERE request_id = ? AND kind IN (`+strings.Join(marks, ",")+`)`, args...)
+	return err
+}
+
+// InsertErasedEvidenceTx preserves the non-reversible hash of an erased
+// fragment. INSERT OR IGNORE keeps repeated erasure idempotent.
+func InsertErasedEvidenceTx(ctx context.Context, tx *sql.Tx, requestID string, row ErasureRow) error {
+	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO erased_identity_evidence
+		(request_id, kind, fragment_hash, erased_by_event, erased_at) VALUES (?,?,?,?,?)`,
+		requestID, row.Kind, row.FragmentHash, row.ErasedByEvent, row.ErasedAt)
+	return err
+}
+
+// ListErasedEvidenceTx returns erased-fragment evidence for matching.
+func ListErasedEvidenceTx(ctx context.Context, tx *sql.Tx, requestID string) ([]ErasureRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT kind, fragment_hash, erased_by_event, erased_at
+		FROM erased_identity_evidence WHERE request_id = ? ORDER BY kind, fragment_hash`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ErasureRow
+	for rows.Next() {
+		var r ErasureRow
+		if err := rows.Scan(&r.Kind, &r.FragmentHash, &r.ErasedByEvent, &r.ErasedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListErasedEvidence returns erased-fragment evidence for the audit summary.
+func (s *Store) ListErasedEvidence(ctx context.Context, requestID string) ([]ErasureRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT kind, fragment_hash, erased_by_event, erased_at
+		FROM erased_identity_evidence WHERE request_id = ? ORDER BY kind, fragment_hash`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ErasureRow
+	for rows.Next() {
+		var r ErasureRow
+		if err := rows.Scan(&r.Kind, &r.FragmentHash, &r.ErasedByEvent, &r.ErasedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListEventPayloadsTx returns the chain's stored payloads for redaction.
+func ListEventPayloadsTx(ctx context.Context, tx *sql.Tx, requestID string) ([]EventRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT seq, channel, payload_json FROM events WHERE request_id = ? ORDER BY seq`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		var e EventRow
+		if err := rows.Scan(&e.Seq, &e.Channel, &e.PayloadJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// UpdateEventPayloadTx rewrites the stored display copy of a payload after
+// redaction. payload_hash is never touched: it anchors replay integrity.
+func UpdateEventPayloadTx(ctx context.Context, tx *sql.Tx, seq int64, payloadJSON string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE events SET payload_json = ? WHERE seq = ?`, payloadJSON, seq)
+	return err
+}
+
+// SetContactErasedTx marks the request's contact data as erased.
+func SetContactErasedTx(ctx context.Context, tx *sql.Tx, requestID string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE canonical_requests SET contact_erased = 1 WHERE request_id = ?`, requestID)
 	return err
 }

@@ -81,6 +81,10 @@ migrations against an existing one is a no-op (covered by
 - `request_identities` (migration v2) — normalized identity fragments per
   request powering deterministic candidate matching; v1 databases are
   backfilled automatically.
+- `erased_identity_evidence` (migration v3, with
+  `canonical_requests.contact_erased`) — non-reversible hashes of contact
+  fragments purged by revocation; keeps matching convergent without
+  retaining raw contact.
 
 Writes are serialized through a single connection with `busy_timeout` and
 immediate transactions; candidate matching executes inside the record's write
@@ -100,20 +104,47 @@ Uniqueness constraints (not connection pooling) guarantee correctness.
   converge to the same single chain — never a fork.
 - Out-of-order revocation → `REVOKES_UNKNOWN_EVENT`, retryable; resend after
   the grant lands. Retrying an old grant after revocation replays the original
-  result and can never resurrect the revoked scope.
+  result and can never resurrect the revoked scope — or erased contact data.
 - Callback events may arrive before the web record exists: they anchor the
   request, and the later web event merges onto the same chain via identity
   evidence (see `docs/api.md` → Match evidence).
 
+## Contact erasure on revocation
+
+Consent folding and contact storage are separate concerns. When a revocation
+removes the **last live `CONTACT_CALLBACK` grant**, the same transaction
+purges raw contact data: `person_json` loses phone/email, live contact
+identity fragments move to `erased_identity_evidence` (hash + erasing event +
+timestamp), and stored payload copies on the chain are redacted to
+`REDACTED#<fragmentHash>` markers. `payload_hash` columns stay original, so
+replay integrity is unchanged.
+
+- Only the revoked scope's data is erased; other scopes, accommodations,
+  names, idNumbers and callback windows are never over-cleared, and erasure
+  never crosses chains.
+- Repeated revocation is idempotent: replay returns the stored result, and a
+  second distinct revocation of an erased scope is an accepted no-op.
+- A late retry carrying the revoked phone cannot resurrect it: without a
+  fresh `CONTACT_CALLBACK` grant, contact fields/fragments are not
+  re-registered and the new payload copy is stored redacted. Matching still
+  converges to the same chain via the non-reversible erased-fragment hashes
+  (`"redacted": true` evidence).
+- A fresh `CONTACT_CALLBACK` grant on a later event is a new consent and
+  re-enables contact registration from that event onward.
+
 ## Data-retention decisions
 
-- Raw envelopes, results and attempts are **retained indefinitely** for audit
-  replay; revocation changes the effective projection, never the history.
-  A production deployment would add a scheduled purge aligned with the
-  legal-services retention policy.
-- Applicant PII is stored once per request (`person_json`). Projections expose
-  only the name; phone/email appear solely while `CONTACT_CALLBACK` consent
-  is effective, and `idNumber` is never exposed over the API.
+- Event evidence is **retained indefinitely** for audit replay — but raw
+  contact data is consent-gated at rest: while `CONTACT_CALLBACK` is
+  effective the chain keeps raw payloads; once its last grant is revoked,
+  raw phone/email are purged from person records, identity fragments and
+  stored payload copies, leaving only non-reversible hashes and original
+  `payload_hash` values. A production deployment would add a scheduled purge
+  aligned with the legal-services retention policy for the remaining data.
+- Applicant PII is minimized at every boundary: projections expose only the
+  name; phone/email appear solely while `CONTACT_CALLBACK` consent is
+  effective; `idNumber` is never exposed; match and erasure evidence carry
+  fragment hashes only.
 - `stateHash` in the audit summary pins the folded state so minimal audit
   summaries, every attempt, and the final normalized result are all stably
   replayable.

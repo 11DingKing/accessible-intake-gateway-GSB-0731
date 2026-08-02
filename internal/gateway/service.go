@@ -4,13 +4,22 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
+
+// contactScope is the consent scope whose revocation triggers contact
+// erasure. The name comes verbatim from the channel contract.
+const contactScope = "CONTACT_CALLBACK"
+
+// contactKinds are the identity fragment kinds erased on contact revocation.
+var contactKinds = []string{identityPhone, identityEmail}
 
 // Service normalizes channel envelopes into canonical requests.
 type Service struct {
@@ -178,12 +187,18 @@ func (s *Service) ProcessEnvelope(ctx context.Context, raw []byte) (RecordResult
 			return failTx(err)
 		}
 		appliedScopes = state.applyRevocation(env)
+		// Contact erasure fires only when this revocation removed the last
+		// live CONTACT_CALLBACK grant; other scopes never touch contact data,
+		// and a still-effective scope is never over-cleared.
+		if contains(appliedScopes, contactScope) && !contains(state.EffectiveConsent(), contactScope) {
+			if err := s.eraseContactTx(ctx, tx, req, env.EventID); err != nil {
+				return failTx(err)
+			}
+			req.ContactErased = true
+		}
 	} else {
 		req, match, err = s.resolveRequestTx(ctx, tx, env)
 		if err != nil {
-			return failTx(err)
-		}
-		if err := accumulatePersonTx(ctx, tx, req, env.Person); err != nil {
 			return failTx(err)
 		}
 		state, err = parseState(req.StateJSON)
@@ -191,16 +206,31 @@ func (s *Service) ProcessEnvelope(ctx context.Context, raw []byte) (RecordResult
 			return failTx(err)
 		}
 		state.applyIntake(env)
+		// After erasure, contact details re-accumulate only with a fresh
+		// CONTACT_CALLBACK grant folded by this very event.
+		allowContact := !req.ContactErased || contains(state.EffectiveConsent(), contactScope)
+		if err := accumulatePersonTx(ctx, tx, req, env.Person, allowContact); err != nil {
+			return failTx(err)
+		}
 	}
 
 	now := s.stamp()
 	if err := UpdateRequestStateTx(ctx, tx, req.RequestID, string(mustMarshal(state)), req.EventCount+1, now); err != nil {
 		return failTx(err)
 	}
+	// On an erased request without a fresh grant, the stored display copy of
+	// the payload keeps raw contact out of the database. payload_hash always
+	// covers the original incoming bytes, so replay integrity is unchanged.
+	storedPayload := string(mustCanonical(raw))
+	if env.EventType == EventTypeIntake && req.ContactErased && !contains(state.EffectiveConsent(), contactScope) {
+		if contract, ok := s.reg.Channel(env.Channel); ok {
+			storedPayload = s.redactPayloadContact(storedPayload, contract.PersonField)
+		}
+	}
 	seq, err := InsertEventTx(ctx, tx, &EventRow{
 		EventID: env.EventID, RequestID: req.RequestID, EventType: env.EventType,
 		Channel: env.Channel, CorrelationID: env.CorrelationID,
-		PayloadJSON: string(mustCanonical(raw)), PayloadHash: hash, AppliedAt: now,
+		PayloadJSON: storedPayload, PayloadHash: hash, AppliedAt: now,
 	})
 	if err != nil {
 		return failTx(err)
@@ -251,8 +281,118 @@ func (s *Service) logAttemptBestEffort(ctx context.Context, a *AttemptRow) {
 		a.EventID, a.PayloadHash, a.Outcome, a.DetailJSON, a.RequestID, a.AttemptedAt)
 }
 
-// --- Read projections -------------------------------------------------
+// eraseContactTx purges raw contact data for one request inside the
+// revocation's transaction and preserves only non-reversible evidence:
+//   - person_json loses phone/email (name and idNumber are not contact
+//     channels and are kept);
+//   - live phone/email identity fragments move to erased_identity_evidence
+//     (hash + erasing event + timestamp), so later events can still match by
+//     hash without the database retaining the raw values;
+//   - stored payload copies on the chain are redacted the same way;
+//   - payload_hash columns are never touched, keeping replay integrity.
+//
+// The operation is idempotent: already-erased rows simply match nothing.
+func (s *Service) eraseContactTx(ctx context.Context, tx *sql.Tx, req *RequestRow, erasedByEvent string) error {
+	now := s.stamp()
+	rows, err := ListIdentityRowsTx(ctx, tx, req.RequestID, contactKinds)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := InsertErasedEvidenceTx(ctx, tx, req.RequestID, ErasureRow{
+			Kind: row.Kind, FragmentHash: row.FragmentHash,
+			ErasedByEvent: erasedByEvent, ErasedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := DeleteIdentitiesTx(ctx, tx, req.RequestID, contactKinds); err != nil {
+		return err
+	}
+	if req.PersonJSON != "" {
+		var p Person
+		if err := json.Unmarshal([]byte(req.PersonJSON), &p); err != nil {
+			return fmt.Errorf("stored person unreadable: %w", err)
+		}
+		p.Phone = ""
+		p.Email = ""
+		if err := UpdateRequestPersonTx(ctx, tx, req.RequestID, string(mustMarshal(&p))); err != nil {
+			return err
+		}
+	}
+	events, err := ListEventPayloadsTx(ctx, tx, req.RequestID)
+	if err != nil {
+		return err
+	}
+	for _, e := range events {
+		contract, ok := s.reg.Channel(e.Channel)
+		if !ok {
+			continue // revocation events carry no person payload
+		}
+		redacted := s.redactPayloadContact(e.PayloadJSON, contract.PersonField)
+		if redacted != e.PayloadJSON {
+			if err := UpdateEventPayloadTx(ctx, tx, e.Seq, redacted); err != nil {
+				return err
+			}
+		}
+	}
+	return SetContactErasedTx(ctx, tx, req.RequestID)
+}
 
+// redactPayloadContact replaces phone/email values inside the payload's
+// person object with a "REDACTED#<fragmentHash>" marker: the hash keeps the
+// evidence legal and non-reversible while the raw contact leaves the
+// database. Other fields are untouched.
+func (s *Service) redactPayloadContact(payloadJSON, personField string) string {
+	if personField == "" {
+		return payloadJSON
+	}
+	dec := json.NewDecoder(strings.NewReader(payloadJSON))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return payloadJSON
+	}
+	personRaw, ok := doc[personField]
+	if !ok {
+		return payloadJSON
+	}
+	person, ok := personRaw.(map[string]any)
+	if !ok {
+		return payloadJSON
+	}
+	changed := false
+	for _, field := range []struct {
+		name string
+		kind string
+	}{
+		{"phone", identityPhone},
+		{"email", identityEmail},
+	} {
+		raw, ok := person[field.name].(string)
+		if !ok || raw == "" || strings.HasPrefix(raw, "REDACTED#") {
+			continue
+		}
+		normalized := raw
+		if field.kind == identityPhone {
+			normalized = digitsOnly(raw)
+		} else {
+			normalized = strings.ToLower(strings.TrimSpace(raw))
+		}
+		person[field.name] = "REDACTED#" + fragmentHash(field.kind, normalized)
+		changed = true
+	}
+	if !changed {
+		return payloadJSON
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return payloadJSON
+	}
+	return string(out)
+}
+
+// --- Read projections -------------------------------------------------
 // PersonView is the minimized applicant view exposed over HTTP.
 type PersonView struct {
 	Name string `json:"name"`
@@ -363,24 +503,34 @@ func (s *Service) ListEvents(ctx context.Context, requestID string) ([]EventView
 	return out, true, nil
 }
 
+// ErasureEvidenceView is the audit-facing, non-reversible proof that one
+// contact fragment was erased.
+type ErasureEvidenceView struct {
+	Kind          string `json:"kind"`
+	FragmentHash  string `json:"fragmentHash"`
+	ErasedByEvent string `json:"erasedByEvent"`
+	ErasedAt      string `json:"erasedAt"`
+}
+
 // AuditView is the minimal audit summary of a request.
 type AuditView struct {
-	RequestID             string            `json:"requestId"`
-	CanonicalVersion      string            `json:"canonicalVersion"`
-	PersonKey             string            `json:"personKey"`
-	EventCount            int               `json:"eventCount"`
-	FirstSeq              int64             `json:"firstSeq,omitempty"`
-	LastSeq               int64             `json:"lastSeq,omitempty"`
-	Channels              []string          `json:"channels"`
-	Correlations          map[string]string `json:"correlations"`
-	Accommodations        []string          `json:"accommodations"`
-	ConsentEffective      []string          `json:"consentEffective"`
-	ConsentRevoked        []string          `json:"consentRevoked"`
-	CallbackWindowMinutes *int64            `json:"callbackWindowMinutes,omitempty"`
-	CallbackWindowKind    string            `json:"callbackWindowKind,omitempty"`
-	StateHash             string            `json:"stateHash"`
-	CreatedAt             string            `json:"createdAt"`
-	UpdatedAt             string            `json:"updatedAt"`
+	RequestID             string                `json:"requestId"`
+	CanonicalVersion      string                `json:"canonicalVersion"`
+	PersonKey             string                `json:"personKey"`
+	EventCount            int                   `json:"eventCount"`
+	FirstSeq              int64                 `json:"firstSeq,omitempty"`
+	LastSeq               int64                 `json:"lastSeq,omitempty"`
+	Channels              []string              `json:"channels"`
+	Correlations          map[string]string     `json:"correlations"`
+	Accommodations        []string              `json:"accommodations"`
+	ConsentEffective      []string              `json:"consentEffective"`
+	ConsentRevoked        []string              `json:"consentRevoked"`
+	CallbackWindowMinutes *int64                `json:"callbackWindowMinutes,omitempty"`
+	CallbackWindowKind    string                `json:"callbackWindowKind,omitempty"`
+	ErasedIdentities      []ErasureEvidenceView `json:"erasedIdentities,omitempty"`
+	StateHash             string                `json:"stateHash"`
+	CreatedAt             string                `json:"createdAt"`
+	UpdatedAt             string                `json:"updatedAt"`
 }
 
 // GetAudit returns the minimal audit summary; StateHash pins the exact
@@ -422,6 +572,16 @@ func (s *Service) GetAudit(ctx context.Context, requestID string) (*AuditView, e
 	if len(rows) > 0 {
 		audit.FirstSeq = rows[0].Seq
 		audit.LastSeq = rows[len(rows)-1].Seq
+	}
+	erased, err := s.store.ListErasedEvidence(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range erased {
+		audit.ErasedIdentities = append(audit.ErasedIdentities, ErasureEvidenceView{
+			Kind: row.Kind, FragmentHash: row.FragmentHash,
+			ErasedByEvent: row.ErasedByEvent, ErasedAt: row.ErasedAt,
+		})
 	}
 	return audit, nil
 }

@@ -78,9 +78,11 @@ func fragmentHash(kind, value string) string {
 
 // FragmentEvidence is one matched or conflicted fragment, by kind and hash
 // only — never the raw value, so evidence is safe to expose before consent.
+// Redacted marks a match against non-reversible erased-fragment evidence.
 type FragmentEvidence struct {
 	Kind         string `json:"kind"`
 	FragmentHash string `json:"fragmentHash"`
+	Redacted     bool   `json:"redacted,omitempty"`
 }
 
 // CandidateEvidence is the per-candidate evaluation trail.
@@ -102,34 +104,47 @@ type MatchEvidence struct {
 	Considered []CandidateEvidence `json:"considered,omitempty"`
 }
 
-// evaluateCandidate compares the event's fragments with one request's
-// fragments, returning matched/conflicted lists (sorted by kind) and the
-// confidence score.
-func evaluateCandidate(eventFrags, requestFrags []fragment) (matched, conflicted []fragment, score int) {
+// evidenceSet indexes erased-fragment hashes by kind for one request.
+type evidenceSet map[string]map[string]bool
+
+func buildEvidenceSet(rows []ErasureRow) evidenceSet {
+	set := evidenceSet{}
+	for _, r := range rows {
+		if set[r.Kind] == nil {
+			set[r.Kind] = map[string]bool{}
+		}
+		set[r.Kind][r.FragmentHash] = true
+	}
+	return set
+}
+
+// evaluateCandidate compares the event's fragments with one request's live
+// fragments and erased evidence, returning matched/conflicted evidence
+// (sorted by kind) and the confidence score. A fragment matching only
+// erased evidence still scores as a match — the hash proves the association
+// without retaining the raw value — but erased fragments can never conflict.
+func evaluateCandidate(eventFrags, requestFrags []fragment, erased evidenceSet) (matched, conflicted []FragmentEvidence, score int) {
 	byKind := map[string][]string{}
 	for _, f := range requestFrags {
 		byKind[f.Kind] = append(byKind[f.Kind], f.Value)
 	}
 	for _, f := range eventFrags {
-		values, ok := byKind[f.Kind]
-		if !ok {
-			continue
-		}
+		hash := fragmentHash(f.Kind, f.Value)
+		values := byKind[f.Kind]
 		if contains(values, f.Value) {
-			matched = append(matched, f)
-			switch f.Kind {
-			case identityIDNumber:
-				score += scoreIDNumberMatch
-			case identityPhone:
-				score += scorePhoneMatch
-			case identityEmail:
-				score += scoreEmailMatch
-			case identityName:
-				score += scoreNameMatch
-			}
+			matched = append(matched, FragmentEvidence{Kind: f.Kind, FragmentHash: hash})
+			score += matchScore(f.Kind)
 			continue
 		}
-		conflicted = append(conflicted, f)
+		if erased[f.Kind][hash] {
+			matched = append(matched, FragmentEvidence{Kind: f.Kind, FragmentHash: hash, Redacted: true})
+			score += matchScore(f.Kind)
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		conflicted = append(conflicted, FragmentEvidence{Kind: f.Kind, FragmentHash: hash})
 		switch f.Kind {
 		case identityIDNumber:
 			score += penaltyIDConflict
@@ -138,24 +153,38 @@ func evaluateCandidate(eventFrags, requestFrags []fragment) (matched, conflicted
 		}
 		// name differences carry no penalty: names are naturally fuzzy.
 	}
-	sortFragments(matched)
-	sortFragments(conflicted)
+	sortEvidence(matched)
+	sortEvidence(conflicted)
 	return matched, conflicted, score
 }
 
-func sortFragments(frags []fragment) {
-	sort.Slice(frags, func(i, j int) bool {
-		if frags[i].Kind != frags[j].Kind {
-			return frags[i].Kind < frags[j].Kind
+func matchScore(kind string) int {
+	switch kind {
+	case identityIDNumber:
+		return scoreIDNumberMatch
+	case identityPhone:
+		return scorePhoneMatch
+	case identityEmail:
+		return scoreEmailMatch
+	default:
+		return scoreNameMatch
+	}
+}
+
+func sortEvidence(evs []FragmentEvidence) {
+	sort.Slice(evs, func(i, j int) bool {
+		if evs[i].Kind != evs[j].Kind {
+			return evs[i].Kind < evs[j].Kind
 		}
-		return frags[i].Value < frags[j].Value
+		return evs[i].FragmentHash < evs[j].FragmentHash
 	})
 }
 
 // candidateOutcome applies the deterministic merge rules:
 // any strong-identifier conflict blocks merging; otherwise any
-// strong-identifier match merges; a name-only overlap stays a candidate.
-func candidateOutcome(matched, conflicted []fragment) string {
+// strong-identifier match merges (including redacted-evidence matches);
+// a name-only overlap stays a candidate.
+func candidateOutcome(matched, conflicted []FragmentEvidence) string {
 	for _, f := range conflicted {
 		if f.Kind == identityIDNumber || f.Kind == identityPhone || f.Kind == identityEmail {
 			return outcomeConflictRejected
@@ -169,21 +198,15 @@ func candidateOutcome(matched, conflicted []fragment) string {
 	return outcomeNameOnly
 }
 
-func toEvidence(frags []fragment) []FragmentEvidence {
-	if len(frags) == 0 {
-		return nil
-	}
-	out := make([]FragmentEvidence, 0, len(frags))
-	for _, f := range frags {
-		out = append(out, FragmentEvidence{Kind: f.Kind, FragmentHash: fragmentHash(f.Kind, f.Value)})
-	}
-	return out
-}
-
+// kindsOf renders evidence kinds for rationale; redacted matches are marked.
 func kindsOf(evs []FragmentEvidence) string {
 	kinds := make([]string, 0, len(evs))
 	for _, e := range evs {
-		kinds = append(kinds, e.Kind)
+		kind := e.Kind
+		if e.Redacted {
+			kind += "(redacted)"
+		}
+		kinds = append(kinds, kind)
 	}
 	sort.Strings(kinds)
 	return strings.Join(kinds, ",")
@@ -228,7 +251,7 @@ func (s *Service) resolveRequestTx(ctx context.Context, tx *sql.Tx, env *Envelop
 		return nil, nil, err
 	} else if existing != nil {
 		frags := personFragments(env.Person)
-		_, _, score := evaluateCandidate(frags, frags)
+		_, _, score := evaluateCandidate(frags, frags, nil)
 		return existing, &MatchEvidence{
 			Decision:  MatchExact,
 			RequestID: existing.RequestID,
@@ -250,14 +273,18 @@ func (s *Service) resolveRequestTx(ctx context.Context, tx *sql.Tx, env *Envelop
 		if err != nil {
 			return nil, nil, err
 		}
-		matched, conflicted, score := evaluateCandidate(frags, requestFrags)
+		erasedRows, err := ListErasedEvidenceTx(ctx, tx, c.RequestID)
+		if err != nil {
+			return nil, nil, err
+		}
+		matched, conflicted, score := evaluateCandidate(frags, requestFrags, buildEvidenceSet(erasedRows))
 		outcome := candidateOutcome(matched, conflicted)
 		ev := CandidateEvidence{
 			RequestID:  c.RequestID,
 			Outcome:    outcome,
 			Score:      score,
-			Matched:    toEvidence(matched),
-			Conflicted: toEvidence(conflicted),
+			Matched:    matched,
+			Conflicted: conflicted,
 		}
 		considered = append(considered, ev)
 		// Candidates arrive oldest-first: the first MERGE is the oldest.
@@ -326,31 +353,48 @@ func (s *Service) resolveRequestTx(ctx context.Context, tx *sql.Tx, env *Envelop
 // accumulatePersonTx folds newly seen person fields into the request's
 // stored person record (first non-empty value wins per field) and registers
 // any new identity fragments, so later candidates can match on them.
-func accumulatePersonTx(ctx context.Context, tx *sql.Tx, req *RequestRow, incoming *Person) error {
-	if req.PersonJSON == "" || incoming == nil {
+//
+// allowContact gates contact fields (phone/email): once a request's contact
+// data has been erased, a later event may only re-register contact details
+// when it carries a fresh CONTACT_CALLBACK grant. Identity fields that are
+// not contact channels (name, idNumber) always accumulate.
+func accumulatePersonTx(ctx context.Context, tx *sql.Tx, req *RequestRow, incoming *Person, allowContact bool) error {
+	if incoming == nil {
 		return nil
 	}
-	var stored Person
-	if err := json.Unmarshal([]byte(req.PersonJSON), &stored); err != nil {
-		return fmt.Errorf("stored person unreadable: %w", err)
+	frags := personFragments(incoming)
+	if !allowContact {
+		kept := frags[:0]
+		for _, f := range frags {
+			if f.Kind != identityPhone && f.Kind != identityEmail {
+				kept = append(kept, f)
+			}
+		}
+		frags = kept
 	}
-	changed := false
-	if stored.Phone == "" && incoming.Phone != "" {
-		stored.Phone = incoming.Phone
-		changed = true
-	}
-	if stored.Email == "" && incoming.Email != "" {
-		stored.Email = incoming.Email
-		changed = true
-	}
-	if stored.IDNumber == "" && incoming.IDNumber != "" {
-		stored.IDNumber = incoming.IDNumber
-		changed = true
-	}
-	if changed {
-		if err := UpdateRequestPersonTx(ctx, tx, req.RequestID, string(mustMarshal(&stored))); err != nil {
-			return err
+	if req.PersonJSON != "" {
+		var stored Person
+		if err := json.Unmarshal([]byte(req.PersonJSON), &stored); err != nil {
+			return fmt.Errorf("stored person unreadable: %w", err)
+		}
+		changed := false
+		if allowContact && stored.Phone == "" && incoming.Phone != "" {
+			stored.Phone = incoming.Phone
+			changed = true
+		}
+		if allowContact && stored.Email == "" && incoming.Email != "" {
+			stored.Email = incoming.Email
+			changed = true
+		}
+		if stored.IDNumber == "" && incoming.IDNumber != "" {
+			stored.IDNumber = incoming.IDNumber
+			changed = true
+		}
+		if changed {
+			if err := UpdateRequestPersonTx(ctx, tx, req.RequestID, string(mustMarshal(&stored))); err != nil {
+				return err
+			}
 		}
 	}
-	return AddIdentitiesTx(ctx, tx, req.RequestID, personFragments(incoming))
+	return AddIdentitiesTx(ctx, tx, req.RequestID, frags)
 }
