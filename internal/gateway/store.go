@@ -3,16 +3,15 @@ package gateway
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
-// schemaVersion is bumped whenever the DDL changes; migrations are
-// idempotent so opening a fresh or existing database always converges.
-const schemaVersion = 1
-
+// schemaDDL is migration v1.
 const schemaDDL = `
 CREATE TABLE IF NOT EXISTS canonical_requests (
     request_id  TEXT PRIMARY KEY,
@@ -50,6 +49,79 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE INDEX IF NOT EXISTS idx_attempts_event ON attempts(event_id, id);
 `
 
+// identityDDL is migration v2: normalized identity fragments per request,
+// powering deterministic candidate matching across channels.
+const identityDDL = `
+CREATE TABLE IF NOT EXISTS request_identities (
+    request_id    TEXT NOT NULL REFERENCES canonical_requests(request_id),
+    kind          TEXT NOT NULL,
+    value         TEXT NOT NULL,
+    fragment_hash TEXT NOT NULL,
+    PRIMARY KEY (request_id, kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_request_identities_lookup ON request_identities(kind, value);
+`
+
+// migration is one ordered, recorded schema step.
+type migration struct {
+	version int
+	apply   func(ctx context.Context, db *sql.DB) error
+}
+
+func applySQL(ddl string) func(ctx context.Context, db *sql.DB) error {
+	return func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, ddl)
+		return err
+	}
+}
+
+// migrations run in version order; each is applied at most once.
+var migrations = []migration{
+	{1, applySQL(schemaDDL)},
+	{2, func(ctx context.Context, db *sql.DB) error {
+		if _, err := db.ExecContext(ctx, identityDDL); err != nil {
+			return err
+		}
+		return backfillIdentities(ctx, db)
+	}},
+}
+
+// backfillIdentities registers fragments for requests stored before v2.
+// INSERT OR IGNORE keeps the backfill safe to re-run.
+func backfillIdentities(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT request_id, person_json FROM canonical_requests WHERE person_json != ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type row struct{ id, personJSON string }
+	var pending []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.personJSON); err != nil {
+			return err
+		}
+		pending = append(pending, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range pending {
+		var p Person
+		if err := json.Unmarshal([]byte(r.personJSON), &p); err != nil {
+			return fmt.Errorf("backfill %s: %w", r.id, err)
+		}
+		for _, f := range personFragments(&p) {
+			if _, err := db.ExecContext(ctx,
+				`INSERT OR IGNORE INTO request_identities (request_id, kind, value, fragment_hash) VALUES (?,?,?,?)`,
+				r.id, f.Kind, f.Value, fragmentHash(f.Kind, f.Value)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Store wraps the SQLite database. A single connection serializes writes;
 // uniqueness constraints are the real guard against duplicate chains.
 type Store struct {
@@ -71,7 +143,8 @@ func Open(dsn string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// Migrate applies the schema. It is safe to run any number of times.
+// Migrate applies pending migrations in version order. It is safe to run
+// any number of times: applied versions are recorded and skipped.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY,
@@ -79,19 +152,20 @@ func (s *Store) Migrate(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-	var applied int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, schemaVersion).Scan(&applied)
-	if err != nil {
-		return fmt.Errorf("check schema version: %w", err)
-	}
-	if applied > 0 {
-		return nil
-	}
-	if _, err := s.db.ExecContext(ctx, schemaDDL); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES (?)`, schemaVersion); err != nil {
-		return fmt.Errorf("record schema version: %w", err)
+	for _, m := range migrations {
+		var applied int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, m.version).Scan(&applied); err != nil {
+			return fmt.Errorf("check schema version %d: %w", m.version, err)
+		}
+		if applied > 0 {
+			continue
+		}
+		if err := m.apply(ctx, s.db); err != nil {
+			return fmt.Errorf("apply migration %d: %w", m.version, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES (?)`, m.version); err != nil {
+			return fmt.Errorf("record schema version %d: %w", m.version, err)
+		}
 	}
 	return nil
 }
@@ -281,4 +355,87 @@ func (s *Store) ListAttemptsForRequest(ctx context.Context, requestID string) ([
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// GetRequestByPersonKeyTx finds a request by its exact identity key.
+func GetRequestByPersonKeyTx(ctx context.Context, tx *sql.Tx, personKey string) (*RequestRow, error) {
+	r, err := scanRequest(tx.QueryRowContext(ctx, `SELECT `+requestCols+` FROM canonical_requests WHERE person_key = ?`, personKey))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+// FindCandidateRequestsTx returns requests sharing at least one identity
+// fragment with the event, in deterministic order (oldest first).
+func FindCandidateRequestsTx(ctx context.Context, tx *sql.Tx, frags []fragment) ([]*RequestRow, error) {
+	if len(frags) == 0 {
+		return nil, nil
+	}
+	pairs := make([]string, 0, len(frags))
+	args := make([]any, 0, len(frags)*2)
+	for _, f := range frags {
+		pairs = append(pairs, "(?,?)")
+		args = append(args, f.Kind, f.Value)
+	}
+	query := `SELECT DISTINCT r.` + strings.Join([]string{
+		"request_id", "person_key", "person_json", "state_json", "event_count", "created_at", "updated_at",
+	}, ", r.") + `
+		FROM canonical_requests r
+		JOIN request_identities i ON i.request_id = r.request_id
+		WHERE (i.kind, i.value) IN (` + strings.Join(pairs, ",") + `)
+		ORDER BY r.created_at, r.request_id`
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*RequestRow
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListIdentitiesTx returns all identity fragments registered on a request.
+func ListIdentitiesTx(ctx context.Context, tx *sql.Tx, requestID string) ([]fragment, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT kind, value FROM request_identities WHERE request_id = ? ORDER BY kind, value`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []fragment
+	for rows.Next() {
+		var f fragment
+		if err := rows.Scan(&f.Kind, &f.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// AddIdentitiesTx registers fragments on a request; existing ones are kept.
+func AddIdentitiesTx(ctx context.Context, tx *sql.Tx, requestID string, frags []fragment) error {
+	for _, f := range frags {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO request_identities (request_id, kind, value, fragment_hash) VALUES (?,?,?,?)`,
+			requestID, f.Kind, f.Value, fragmentHash(f.Kind, f.Value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UpdateRequestPersonTx persists the accumulated person record.
+func UpdateRequestPersonTx(ctx context.Context, tx *sql.Tx, requestID, personJSON string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE canonical_requests SET person_json = ? WHERE request_id = ?`, personJSON, requestID)
+	return err
 }

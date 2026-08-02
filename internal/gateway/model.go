@@ -69,15 +69,16 @@ func (e FieldError) Error() string { return e.Code + ": " + e.Message }
 // It is stored next to the accepted event so byte-identical retries can be
 // answered with the original result.
 type RecordResult struct {
-	EventID          string       `json:"eventId"`
-	Status           string       `json:"status"`
-	RequestID        string       `json:"requestId,omitempty"`
-	Seq              int64        `json:"seq,omitempty"`
-	IdempotentReplay bool         `json:"idempotentReplay,omitempty"`
-	Retryable        bool         `json:"retryable,omitempty"`
-	AppliedScopes    []string     `json:"appliedScopes,omitempty"`
-	EffectiveConsent []string     `json:"effectiveConsent,omitempty"`
-	Errors           []FieldError `json:"errors,omitempty"`
+	EventID          string         `json:"eventId"`
+	Status           string         `json:"status"`
+	RequestID        string         `json:"requestId,omitempty"`
+	Seq              int64          `json:"seq,omitempty"`
+	IdempotentReplay bool           `json:"idempotentReplay,omitempty"`
+	Retryable        bool           `json:"retryable,omitempty"`
+	AppliedScopes    []string       `json:"appliedScopes,omitempty"`
+	EffectiveConsent []string       `json:"effectiveConsent,omitempty"`
+	Match            *MatchEvidence `json:"match,omitempty"`
+	Errors           []FieldError   `json:"errors,omitempty"`
 }
 
 // Person is the normalized applicant identity shared by all channels.
@@ -110,6 +111,36 @@ type ChannelLink struct {
 	CorrelationID         string   `json:"correlationId"`
 	EventIDs              []string `json:"eventIds"`
 	CallbackWindowMinutes *int64   `json:"callbackWindowMinutes,omitempty"`
+	// CallbackWindowKind is derived at projection time (never stored).
+	CallbackWindowKind string `json:"callbackWindowKind,omitempty"`
+}
+
+// Callback window classifications, derived deterministically from the
+// minute value alone (no start time exists in the contract). maxSameDayMinutes
+// is 24h: a longer window necessarily crosses a day boundary.
+const maxSameDayMinutes = 24 * 60
+
+const (
+	CallbackImmediate = "IMMEDIATE"
+	CallbackSameDay   = "SAME_DAY"
+	CallbackCrossDay  = "CROSS_DAY"
+)
+
+// callbackWindowKind classifies a callback window: 0 → IMMEDIATE,
+// 1..1440 → SAME_DAY, >1440 → CROSS_DAY. Negative values never reach here
+// (rejected at validation).
+func callbackWindowKind(minutes *int64) string {
+	if minutes == nil {
+		return ""
+	}
+	switch {
+	case *minutes == 0:
+		return CallbackImmediate
+	case *minutes <= maxSameDayMinutes:
+		return CallbackSameDay
+	default:
+		return CallbackCrossDay
+	}
 }
 
 // ConsentState tracks which event granted or revoked each scope, so a

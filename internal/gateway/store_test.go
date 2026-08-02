@@ -55,8 +55,8 @@ func TestMigrateIsRepeatable(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&versionCount); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if versionCount != 1 {
-		t.Fatalf("expected 1 recorded migration, got %d", versionCount)
+	if versionCount != len(migrations) {
+		t.Fatalf("expected %d recorded migrations, got %d", len(migrations), versionCount)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)

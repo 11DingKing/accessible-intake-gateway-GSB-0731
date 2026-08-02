@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -110,8 +111,10 @@ func TestSameKeySamePayloadReplaysOriginal(t *testing.T) {
 		t.Fatalf("expected idempotentReplay flag: %+v", replay)
 	}
 	replay.IdempotentReplay = false // flag is replay-only; the rest must equal the original
-	if fmt.Sprintf("%+v", replay) != fmt.Sprintf("%+v", first) {
-		t.Fatalf("replay must return the original result:\nfirst:  %+v\nreplay: %+v", first, replay)
+	firstJSON, _ := json.Marshal(first)
+	replayJSON, _ := json.Marshal(replay)
+	if string(firstJSON) != string(replayJSON) {
+		t.Fatalf("replay must return the original result:\nfirst:  %s\nreplay: %s", firstJSON, replayJSON)
 	}
 
 	events, err := store.ListEvents(context.Background(), first.RequestID)

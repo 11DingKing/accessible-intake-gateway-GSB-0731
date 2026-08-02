@@ -14,36 +14,97 @@ Base URL: `http://localhost:8080` (default). All bodies are JSON.
 
 ### Envelope (what channels POST)
 
-| Field | Type | INTAKE | REVOCATION | Notes |
-|---|---|---|---|---|
-| `eventId` | string | required | required | Idempotency key. |
-| `eventType` | string | optional | optional | `INTAKE` (default) or `REVOCATION`; `revokes` present implies `REVOCATION`. |
-| `channel` | string | required | optional | One of `PHYSICAL`, `HOTLINE`, `WEB`. |
-| `deskReceiptNo` / `callRef` / `submissionId` | string | required | – | Source correlation field, per channel contract (`sourceIdField`). |
-| `visitor` / `caller` / `applicant` | object | optional | – | Person object, per channel contract (`personField`). |
-| `accommodations` | string[] | optional | – | Must be registered codes. |
-| `consent` | string[] | optional | – | Must be registered scopes. |
-| `callbackWindowMinutes` | integer ≥ 0 | HOTLINE only | – | Minute-based callback window. |
-| `revokes` | string | – | required | `eventId` of the accepted event whose grant is revoked. |
-| `scopes` | string[] | – | required | Non-empty subset of registered scopes. |
+| Field                                        | Type        | INTAKE       | REVOCATION | Notes                                                                       |
+| -------------------------------------------- | ----------- | ------------ | ---------- | --------------------------------------------------------------------------- |
+| `eventId`                                    | string      | required     | required   | Idempotency key.                                                            |
+| `eventType`                                  | string      | optional     | optional   | `INTAKE` (default) or `REVOCATION`; `revokes` present implies `REVOCATION`. |
+| `channel`                                    | string      | required     | optional   | One of `PHYSICAL`, `HOTLINE`, `WEB`.                                        |
+| `deskReceiptNo` / `callRef` / `submissionId` | string      | required     | –          | Source correlation field, per channel contract (`sourceIdField`).           |
+| `visitor` / `caller` / `applicant`           | object      | optional     | –          | Person object, per channel contract (`personField`).                        |
+| `accommodations`                             | string[]    | optional     | –          | Must be registered codes.                                                   |
+| `consent`                                    | string[]    | optional     | –          | Must be registered scopes.                                                  |
+| `callbackWindowMinutes`                      | integer ≥ 0 | HOTLINE only | –          | Minute-based callback window; see classification below.                     |
+| `revokes`                                    | string      | –            | required   | `eventId` of the accepted event whose grant is revoked.                     |
+| `scopes`                                     | string[]    | –            | required   | Non-empty subset of registered scopes.                                      |
+
+### Callback window classification
+
+The minute unit from round 1 is unchanged. The value is classified
+deterministically from the minutes alone (the contract carries no start
+time), and the class is exposed as `callbackWindowKind` on the request
+projection, the per-channel link, and the audit summary:
+
+| Value                    | Class       | Handling                                          |
+| ------------------------ | ----------- | ------------------------------------------------- |
+| absent                   | –           | no callback window on the request                 |
+| `0`                      | `IMMEDIATE` | accepted; immediate callback                      |
+| `1..1440`                | `SAME_DAY`  | accepted; window fits in one day (1440 = 24h)     |
+| `>1440`                  | `CROSS_DAY` | accepted; window necessarily spans a day boundary |
+| negative / fractional    | –           | rejected: `INVALID_CALLBACK_WINDOW`               |
+| on a non-HOTLINE channel | –           | rejected: `INVALID_FIELD_FOR_CHANNEL`             |
 
 ### Person object
 
 ```json
-{"name": "Li Ming", "phone": "+86 138-0000-0000", "email": "li@example.org", "idNumber": "..."}
+{
+  "name": "Li Ming",
+  "phone": "+86 138-0000-0000",
+  "email": "li@example.org",
+  "idNumber": "..."
+}
 ```
 
 Optional, but when present it must carry a non-empty `name` and at least one
 of `phone`, `email`, `idNumber` (`INVALID_PERSON` otherwise).
 
-**Merge rule.** Events merge into one canonical request via a deterministic
-person key: `SHA-256(normalized name + strongest identifier)` where the
-strongest identifier is `idNumber` > `phone` > `email`. Normalization:
-name is case-folded with whitespace collapsed; phone is digits-only; email is
-lower-cased. Adapters should therefore submit full international phone
-formats. An event **without** a usable person identity can never be merged
-safely — it anchors a standalone request keyed by its own `eventId`
-(documented behavior, never a silent guess).
+**Merge rule.** Events merge into one canonical request in two deterministic
+stages, evaluated inside the record's write transaction (writes are
+serialized, so concurrent channel claims can never fork a second chain):
+
+1. **Exact key** — `SHA-256(normalized name + strongest identifier)` where
+   the strongest identifier is `idNumber` > `phone` > `email`. Normalization:
+   name is case-folded with whitespace collapsed; phone is digits-only; email
+   is lower-cased. Adapters should submit full international phone formats.
+2. **Candidate match** — when the exact key misses, normalized identity
+   fragments (`name`, `phone`, `email`, `idNumber`) are compared with every
+   request sharing at least one fragment. Scoring: `idNumber` match +100,
+   `phone`/`email` match +50, `name` match +10; `phone`/`email` conflict
+   −100, `idNumber` conflict −1000 (hard block). Rules per candidate:
+   - any strong-identifier (`idNumber`/`phone`/`email`) **conflict** →
+     `CONFLICT_REJECTED`, merging is blocked even if another identifier
+     matches;
+   - else any strong-identifier **match** → `MERGE`; the oldest candidate
+     wins when several merge;
+   - name-only overlap → `NAME_ONLY`, recorded but never merged.
+
+   An event **without** a usable person identity never merges: it anchors a
+   standalone request keyed by its own `eventId` (never a silent guess).
+
+**Match evidence.** Every accepted INTAKE result carries a `match` object —
+persisted with the event, so replays return it verbatim and audits replay
+deterministically:
+
+```json
+"match": {
+  "decision": "MERGED",
+  "requestId": "req_4f2a…",
+  "score": 50,
+  "rationale": ["merged into req_4f2a…: phone matched with no strong-identifier conflict"],
+  "considered": [
+    {"requestId": "req_4f2a…", "outcome": "MERGE", "score": 50,
+     "matched": [{"kind": "phone", "fragmentHash": "9f2e…"}],
+     "conflicted": [{"kind": "name", "fragmentHash": "71ab…"}]}
+  ]
+}
+```
+
+`decision` ∈ `EXACT` | `MERGED` | `CANDIDATE` | `NEW` | `STANDALONE`.
+`CANDIDATE` means partial overlap existed but was insufficient or blocked —
+the event anchors a new standalone request, and `considered` records why.
+Evidence exposes fragment **kinds and hashes only, never raw values**, so no
+contact detail is revealed before consent is confirmed. Identity fragments
+brought by merged events accumulate on the request, letting later events
+match on them.
 
 ### Per-record result
 
@@ -57,14 +118,26 @@ safely — it anchors a standalone request keyed by its own `eventId`
   "retryable": false,
   "appliedScopes": ["CASE_SUMMARY_TRANSFER"],
   "effectiveConsent": ["ACCOMMODATION_TRANSFER", "CONTACT_CALLBACK"],
-  "errors": [{"code": "UNKNOWN_ACCOMMODATION", "field": "accommodations", "message": "…"}]
+  "match": {
+    "decision": "MERGED",
+    "requestId": "req_4f2a…",
+    "score": 50,
+    "rationale": ["…"]
+  },
+  "errors": [
+    {
+      "code": "UNKNOWN_ACCOMMODATION",
+      "field": "accommodations",
+      "message": "…"
+    }
+  ]
 }
 ```
 
 `status` ∈ `ACCEPTED` | `REPLAYED`(attempts log) | `CONFLICT` | `FAILED`.
-On replay the body is the **original stored result** plus
-`idempotentReplay: true`. `errors` lists *every* field-level problem on the
-record.
+On replay the body is the **original stored result** (including its `match`
+evidence) plus `idempotentReplay: true`. `errors` lists _every_ field-level
+problem on the record.
 
 ## Endpoints
 
@@ -79,14 +152,14 @@ curl -X POST localhost:8080/v1/intake/events -d '{
 }'
 ```
 
-| HTTP | Meaning |
-|---|---|
-| 201 | Accepted; event appended to the chain, state folded. |
-| 200 | Idempotent replay (same `eventId`, same payload) — original result. |
-| 409 | Conflict: same `eventId`, different payload (`PAYLOAD_CONFLICT`). |
-| 422 | Validation failure; `errors` lists every problem. |
-| 503 | Transient failure; `retryable: true`, safe to retry as-is. |
-| 400 | Body is not JSON. |
+| HTTP | Meaning                                                             |
+| ---- | ------------------------------------------------------------------- |
+| 201  | Accepted; event appended to the chain, state folded.                |
+| 200  | Idempotent replay (same `eventId`, same payload) — original result. |
+| 409  | Conflict: same `eventId`, different payload (`PAYLOAD_CONFLICT`).   |
+| 422  | Validation failure; `errors` lists every problem.                   |
+| 503  | Transient failure; `retryable: true`, safe to retry as-is.          |
+| 400  | Body is not JSON.                                                   |
 
 Revocation example:
 
@@ -114,47 +187,69 @@ its grant lands.
 {
   "requestId": "req_4f2a…",
   "canonicalVersion": "intake.v1",
-  "person": {"name": "Li Ming"},
-  "contact": {"phone": "+86 138 0000 0000"},
+  "person": { "name": "Li Ming" },
+  "contact": { "phone": "+86 138 0000 0000" },
   "channels": {
-    "PHYSICAL": {"correlationField": "deskReceiptNo", "correlationId": "D-88", "eventIds": ["EV-P-001"]},
-    "HOTLINE":  {"correlationField": "callRef", "correlationId": "C-19", "eventIds": ["EV-H-001"], "callbackWindowMinutes": 45},
-    "WEB":      {"correlationField": "submissionId", "correlationId": "W-71", "eventIds": ["EV-W-001"]}
+    "PHYSICAL": {
+      "correlationField": "deskReceiptNo",
+      "correlationId": "D-88",
+      "eventIds": ["EV-P-001"]
+    },
+    "HOTLINE": {
+      "correlationField": "callRef",
+      "correlationId": "C-19",
+      "eventIds": ["EV-H-001"],
+      "callbackWindowMinutes": 45,
+      "callbackWindowKind": "SAME_DAY"
+    },
+    "WEB": {
+      "correlationField": "submissionId",
+      "correlationId": "W-71",
+      "eventIds": ["EV-W-001"]
+    }
   },
   "accommodations": ["BRAILLE_MATERIAL"],
   "consentEffective": ["ACCOMMODATION_TRANSFER", "CONTACT_CALLBACK"],
   "consentRevoked": ["CASE_SUMMARY_TRANSFER"],
   "callbackWindowMinutes": 45,
+  "callbackWindowKind": "SAME_DAY",
   "eventCount": 4,
-  "createdAt": "…", "updatedAt": "…"
+  "createdAt": "…",
+  "updatedAt": "…"
 }
 ```
 
 `contact` (phone/email) is present **only while `CONTACT_CALLBACK` is
-effective**. Revoking it hides contact details immediately, and replaying an
-older grant never brings them back. `idNumber` is never exposed. 404 when the
-request does not exist.
+effective** — before consent is confirmed, and after it is revoked, raw
+contact details never leave the service (match evidence carries hashes
+only). Replaying an older grant never brings contact back. `idNumber` is
+never exposed. 404 when the request does not exist.
 
 ### `GET /v1/requests/{requestId}/events` — event chain
 
 `{"events": […]}` ordered by `seq`: `seq`, `eventId`, `eventType`, `channel`,
-`correlationId`, `payloadHash`, `appliedAt`, and the canonicalized original
-`payload`. Byte-stable across reads.
+`correlationId`, `payloadHash`, `appliedAt`, the canonicalized original
+`payload`, and the persisted `match` evidence for INTAKE events. Byte-stable
+across reads.
 
 ### `GET /v1/requests/{requestId}/audit` — minimal audit summary
 
 ```json
 {
-  "requestId": "req_4f2a…", "canonicalVersion": "intake.v1",
-  "personKey": "person:7c9e…", "eventCount": 4,
-  "firstSeq": 1, "lastSeq": 4,
+  "requestId": "req_4f2a…",
+  "canonicalVersion": "intake.v1",
+  "personKey": "person:7c9e…",
+  "eventCount": 4,
+  "firstSeq": 1,
+  "lastSeq": 4,
   "channels": ["HOTLINE", "PHYSICAL", "WEB"],
-  "correlations": {"PHYSICAL": "D-88", "HOTLINE": "C-19", "WEB": "W-71"},
+  "correlations": { "PHYSICAL": "D-88", "HOTLINE": "C-19", "WEB": "W-71" },
   "accommodations": ["BRAILLE_MATERIAL"],
   "consentEffective": ["ACCOMMODATION_TRANSFER", "CONTACT_CALLBACK"],
   "consentRevoked": ["CASE_SUMMARY_TRANSFER"],
   "stateHash": "sha256-of-folded-state",
-  "createdAt": "…", "updatedAt": "…"
+  "createdAt": "…",
+  "updatedAt": "…"
 }
 ```
 
@@ -186,10 +281,13 @@ once the event exists.
    own merits.
 4. **Transient failures are retryable.** Adapter/DB hiccups roll back fully,
    return `retryable: true` (503 single / `FAILED` item in batch) and are
-   logged as `TRANSIENT_FAILURE`.
-5. **Concurrency.** `canonical_requests.person_key` is `UNIQUE`; two channels
-   reporting the same applicant concurrently resolve to one request and one
-   `seq`-ordered event chain.
+   logged as `TRANSIENT_FAILURE`; the recovery retry re-runs matching against
+   committed state and converges to the same single chain.
+5. **Concurrency.** `canonical_requests.person_key` is `UNIQUE`, and
+   candidate matching runs inside the record's serialized write transaction:
+   two channels claiming the same applicant concurrently — by exact key or by
+   fuzzy identity evidence — resolve to one request and one `seq`-ordered
+   event chain. Out-of-order replays never re-fold or re-match.
 
 ## Error codes
 

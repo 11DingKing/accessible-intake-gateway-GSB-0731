@@ -140,6 +140,7 @@ func (s *Service) ProcessEnvelope(ctx context.Context, raw []byte) (RecordResult
 	var req *RequestRow
 	var state *RequestState
 	var appliedScopes []string
+	var match *MatchEvidence
 
 	if env.EventType == EventTypeRevocation {
 		target, err := GetEventTx(ctx, tx, env.Revokes)
@@ -178,31 +179,16 @@ func (s *Service) ProcessEnvelope(ctx context.Context, raw []byte) (RecordResult
 		}
 		appliedScopes = state.applyRevocation(env)
 	} else {
-		state = newRequestState(s.reg.CanonicalVersion)
-		personJSON := ""
-		if env.Person != nil {
-			personJSON = string(mustMarshal(env.Person))
-		}
-		now := s.stamp()
-		candidate := &RequestRow{
-			RequestID:  newRequestID(),
-			PersonKey:  personMergeKey(env),
-			PersonJSON: personJSON,
-			StateJSON:  string(mustMarshal(state)),
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
-		var created bool
-		var err error
-		req, created, err = InsertRequestIfAbsentTx(ctx, tx, candidate)
+		req, match, err = s.resolveRequestTx(ctx, tx, env)
 		if err != nil {
 			return failTx(err)
 		}
-		if !created {
-			state, err = parseState(req.StateJSON)
-			if err != nil {
-				return failTx(err)
-			}
+		if err := accumulatePersonTx(ctx, tx, req, env.Person); err != nil {
+			return failTx(err)
+		}
+		state, err = parseState(req.StateJSON)
+		if err != nil {
+			return failTx(err)
 		}
 		state.applyIntake(env)
 	}
@@ -225,6 +211,7 @@ func (s *Service) ProcessEnvelope(ctx context.Context, raw []byte) (RecordResult
 	result.Seq = seq
 	result.AppliedScopes = appliedScopes
 	result.EffectiveConsent = state.EffectiveConsent()
+	result.Match = match
 	if err := SetEventResultTx(ctx, tx, seq, string(mustMarshal(result))); err != nil {
 		return failTx(err)
 	}
@@ -288,6 +275,7 @@ type RequestView struct {
 	ConsentEffective      []string                `json:"consentEffective"`
 	ConsentRevoked        []string                `json:"consentRevoked"`
 	CallbackWindowMinutes *int64                  `json:"callbackWindowMinutes,omitempty"`
+	CallbackWindowKind    string                  `json:"callbackWindowKind,omitempty"`
 	EventCount            int                     `json:"eventCount"`
 	CreatedAt             string                  `json:"createdAt"`
 	UpdatedAt             string                  `json:"updatedAt"`
@@ -305,6 +293,9 @@ func (s *Service) GetRequest(ctx context.Context, requestID string) (*RequestVie
 	if err != nil {
 		return nil, err
 	}
+	for _, link := range state.Channels {
+		link.CallbackWindowKind = callbackWindowKind(link.CallbackWindowMinutes)
+	}
 	view := &RequestView{
 		RequestID:             req.RequestID,
 		CanonicalVersion:      state.CanonicalVersion,
@@ -313,6 +304,7 @@ func (s *Service) GetRequest(ctx context.Context, requestID string) (*RequestVie
 		ConsentEffective:      state.EffectiveConsent(),
 		ConsentRevoked:        state.RevokedScopes(),
 		CallbackWindowMinutes: state.CallbackWindowMinutes,
+		CallbackWindowKind:    callbackWindowKind(state.CallbackWindowMinutes),
 		EventCount:            req.EventCount,
 		CreatedAt:             req.CreatedAt,
 		UpdatedAt:             req.UpdatedAt,
@@ -340,6 +332,7 @@ type EventView struct {
 	PayloadHash   string          `json:"payloadHash"`
 	AppliedAt     string          `json:"appliedAt"`
 	Payload       json.RawMessage `json:"payload"`
+	Match         *MatchEvidence  `json:"match,omitempty"`
 }
 
 // ListEvents returns the request's full event chain, stable in seq order.
@@ -354,10 +347,17 @@ func (s *Service) ListEvents(ctx context.Context, requestID string) ([]EventView
 	}
 	out := make([]EventView, 0, len(rows))
 	for _, r := range rows {
+		var match *MatchEvidence
+		if r.ResultJSON != "" {
+			var stored RecordResult
+			if err := json.Unmarshal([]byte(r.ResultJSON), &stored); err == nil {
+				match = stored.Match
+			}
+		}
 		out = append(out, EventView{
 			Seq: r.Seq, EventID: r.EventID, EventType: r.EventType, Channel: r.Channel,
 			CorrelationID: r.CorrelationID, PayloadHash: r.PayloadHash, AppliedAt: r.AppliedAt,
-			Payload: json.RawMessage(r.PayloadJSON),
+			Payload: json.RawMessage(r.PayloadJSON), Match: match,
 		})
 	}
 	return out, true, nil
@@ -365,20 +365,22 @@ func (s *Service) ListEvents(ctx context.Context, requestID string) ([]EventView
 
 // AuditView is the minimal audit summary of a request.
 type AuditView struct {
-	RequestID        string            `json:"requestId"`
-	CanonicalVersion string            `json:"canonicalVersion"`
-	PersonKey        string            `json:"personKey"`
-	EventCount       int               `json:"eventCount"`
-	FirstSeq         int64             `json:"firstSeq,omitempty"`
-	LastSeq          int64             `json:"lastSeq,omitempty"`
-	Channels         []string          `json:"channels"`
-	Correlations     map[string]string `json:"correlations"`
-	Accommodations   []string          `json:"accommodations"`
-	ConsentEffective []string          `json:"consentEffective"`
-	ConsentRevoked   []string          `json:"consentRevoked"`
-	StateHash        string            `json:"stateHash"`
-	CreatedAt        string            `json:"createdAt"`
-	UpdatedAt        string            `json:"updatedAt"`
+	RequestID             string            `json:"requestId"`
+	CanonicalVersion      string            `json:"canonicalVersion"`
+	PersonKey             string            `json:"personKey"`
+	EventCount            int               `json:"eventCount"`
+	FirstSeq              int64             `json:"firstSeq,omitempty"`
+	LastSeq               int64             `json:"lastSeq,omitempty"`
+	Channels              []string          `json:"channels"`
+	Correlations          map[string]string `json:"correlations"`
+	Accommodations        []string          `json:"accommodations"`
+	ConsentEffective      []string          `json:"consentEffective"`
+	ConsentRevoked        []string          `json:"consentRevoked"`
+	CallbackWindowMinutes *int64            `json:"callbackWindowMinutes,omitempty"`
+	CallbackWindowKind    string            `json:"callbackWindowKind,omitempty"`
+	StateHash             string            `json:"stateHash"`
+	CreatedAt             string            `json:"createdAt"`
+	UpdatedAt             string            `json:"updatedAt"`
 }
 
 // GetAudit returns the minimal audit summary; StateHash pins the exact
@@ -397,18 +399,20 @@ func (s *Service) GetAudit(ctx context.Context, requestID string) (*AuditView, e
 		return nil, err
 	}
 	audit := &AuditView{
-		RequestID:        req.RequestID,
-		CanonicalVersion: state.CanonicalVersion,
-		PersonKey:        req.PersonKey,
-		EventCount:       req.EventCount,
-		Channels:         []string{},
-		Correlations:     map[string]string{},
-		Accommodations:   state.Accommodations,
-		ConsentEffective: state.EffectiveConsent(),
-		ConsentRevoked:   state.RevokedScopes(),
-		StateHash:        stateHash(req.StateJSON),
-		CreatedAt:        req.CreatedAt,
-		UpdatedAt:        req.UpdatedAt,
+		RequestID:             req.RequestID,
+		CanonicalVersion:      state.CanonicalVersion,
+		PersonKey:             req.PersonKey,
+		EventCount:            req.EventCount,
+		Channels:              []string{},
+		Correlations:          map[string]string{},
+		Accommodations:        state.Accommodations,
+		ConsentEffective:      state.EffectiveConsent(),
+		ConsentRevoked:        state.RevokedScopes(),
+		CallbackWindowMinutes: state.CallbackWindowMinutes,
+		CallbackWindowKind:    callbackWindowKind(state.CallbackWindowMinutes),
+		StateHash:             stateHash(req.StateJSON),
+		CreatedAt:             req.CreatedAt,
+		UpdatedAt:             req.UpdatedAt,
 	}
 	for ch, link := range state.Channels {
 		audit.Channels = append(audit.Channels, ch)

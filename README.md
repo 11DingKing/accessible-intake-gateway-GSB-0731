@@ -23,11 +23,17 @@ loaded from it and never renamed.
 
 - Go 1.24, standard-library HTTP stack, SQLite via `modernc.org/sqlite`
   (pure Go, no cgo). No web framework, no message broker.
-- One canonical request model fed by the three channel adapters, keyed by a
-  deterministic person identity; events without person identity anchor
-  standalone requests instead of being guessed into a merge.
+- One canonical request model fed by the three channel adapters. Identity
+  resolution is two-stage and deterministic: exact person key first, then
+  scored candidate matching over normalized identity fragments
+  (idNumber/phone/email/name), with strong-identifier conflicts blocking
+  merges. Every accepted result records its match decision, rationale and
+  hashed confidence evidence — never raw contact values before consent.
 - Idempotency: same `eventId` + same payload replays the stored original
   result; same `eventId` + different payload is an explicit 409 conflict.
+- Hotline callback windows stay minute-based and are classified
+  deterministically: `0` → `IMMEDIATE`, `1..1440` → `SAME_DAY`,
+  `>1440` → `CROSS_DAY`, negative/fractional → validation error.
 - Native verification: `go test ./...` and `go run ./cmd/server`.
 
 ## Build, test, run
@@ -39,11 +45,11 @@ go run ./cmd/server  # serve on :8080 with ./intake.db
 
 Server flags (env vars in parentheses):
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `-addr` (`ADDR`) | `:8080` | Listen address. |
-| `-db` (`DB_DSN`) | `file:intake.db?_pragma=busy_timeout(5000)&_txlock=immediate` | SQLite DSN. |
-| `-contracts` (`CONTRACTS`) | `materials/channel-contracts.json` | Channel contract registry. |
+| Flag                       | Default                                                       | Purpose                    |
+| -------------------------- | ------------------------------------------------------------- | -------------------------- |
+| `-addr` (`ADDR`)           | `:8080`                                                       | Listen address.            |
+| `-db` (`DB_DSN`)           | `file:intake.db?_pragma=busy_timeout(5000)&_txlock=immediate` | SQLite DSN.                |
+| `-contracts` (`CONTRACTS`) | `materials/channel-contracts.json`                            | Channel contract registry. |
 
 Smoke check:
 
@@ -59,21 +65,27 @@ curl -X POST localhost:8080/v1/intake/batches -d '{"records":[
 
 ## Persistence setup
 
-SQLite, schema versioned in `schema_migrations`. `Migrate` runs on startup and
-is **idempotent** — all DDL uses `IF NOT EXISTS`, so a fresh database builds
-completely and re-running migrations against an existing one is a no-op
-(covered by `TestMigrateIsRepeatable`). Three tables:
+SQLite, schema versioned in `schema_migrations`. `Migrate` runs on startup
+and applies pending migrations in version order — all DDL uses
+`IF NOT EXISTS`, so a fresh database builds completely and re-running
+migrations against an existing one is a no-op (covered by
+`TestMigrateIsRepeatable` and `TestMigrationBackfillsIdentities`). Tables:
 
 - `canonical_requests` — one row per applicant request; `person_key UNIQUE`
   is the guard that keeps concurrent cross-channel reports on a single chain.
 - `events` — the accepted event chain (`seq` order), raw canonical payload,
-  payload hash, and the stored original result for byte-identical replay.
+  payload hash, and the stored original result (including match evidence)
+  for byte-identical replay.
 - `attempts` — every submission attempt with outcome and error detail, so
   failures, conflicts and replays are auditable even when nothing was applied.
+- `request_identities` (migration v2) — normalized identity fragments per
+  request powering deterministic candidate matching; v1 databases are
+  backfilled automatically.
 
 Writes are serialized through a single connection with `busy_timeout` and
-immediate transactions; uniqueness constraints (not connection pooling)
-guarantee correctness.
+immediate transactions; candidate matching executes inside the record's write
+transaction, so concurrent claims always evaluate the same committed state.
+Uniqueness constraints (not connection pooling) guarantee correctness.
 
 ## Retry behavior
 
@@ -84,9 +96,14 @@ guarantee correctness.
   consumed, so a corrected retry is processed on its own merits.
 - Transient failure (adapter/DB) → full rollback, `retryable: true`
   (503 single / `FAILED` batch item), attempt logged as `TRANSIENT_FAILURE`.
+  Recovery retries re-run deterministic matching against committed state and
+  converge to the same single chain — never a fork.
 - Out-of-order revocation → `REVOKES_UNKNOWN_EVENT`, retryable; resend after
   the grant lands. Retrying an old grant after revocation replays the original
   result and can never resurrect the revoked scope.
+- Callback events may arrive before the web record exists: they anchor the
+  request, and the later web event merges onto the same chain via identity
+  evidence (see `docs/api.md` → Match evidence).
 
 ## Data-retention decisions
 
