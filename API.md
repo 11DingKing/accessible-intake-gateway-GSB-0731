@@ -218,9 +218,36 @@ even before consent):
 
 Raw contact methods (`phone`/`email`) and the raw `callbackWindowMinutes` are
 returned **only** while `CONTACT_CALLBACK` is effective. Before consent — or
-after a sticky revocation — the projection shows only
-`hasPendingContact: true` and the non-identifying disposition; the raw values
-are never emitted, including on retries or replays.
+after a sticky revocation — the projection shows only the non-identifying
+disposition; the raw values are never emitted, including on retries or replays.
+
+### Revocation erases the governed data (scope-precise)
+
+Revoking a scope does more than gate the projection — it **erases** the raw /
+reversible data that scope governs, while preserving legitimate, non-reversible
+event evidence. Revoking `CONTACT_CALLBACK`:
+
+- **Deletes** the raw `contact_method` rows (phone/email) and **nulls** the exact
+  `callback_window_minutes`.
+- **Keeps** the coarse `callbackDisposition` bucket, the identity-fragment
+  **hashes** (non-reversible), the `match_evidence`, and the full event chain.
+- **Never touches** other scopes' data — `CASE_SUMMARY_TRANSFER` and its state
+  are untouched, so revocation is not over-broad.
+
+Guarantees under adversarial ordering:
+
+- **Idempotent.** Repeating a revocation (a second revoke event, or an exact
+  replay) erases nothing further and adds no duplicate consent state.
+- **No resurrection.** A late-arriving or retried event that carries a value
+  governed by an already-revoked scope is **suppressed** — the raw value is not
+  re-stored — even though the event itself is still accepted and appended to the
+  chain as legitimate evidence (audited as `CONTACT_SUPPRESSED`).
+- **One chain.** A revocation resolves to the converged request via the alias
+  index or the referenced event's owner, so it never forks a second chain; this
+  holds under out-of-order arrival, transient-failure retries, and concurrent
+  transactions.
+- **Auditable, non-reversible.** Each revocation writes `CONSENT_REVOKED` and a
+  `CONTACT_ERASED scopes=… clearedItems=N` summary (counts only, no raw values).
 
 ---
 

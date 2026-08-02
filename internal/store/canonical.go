@@ -69,9 +69,23 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 	}
 
 	// Persist the callback window/disposition and any raw contact methods. Raw
-	// contact values are stored but only ever surface through the consent gate.
-	if err := projectContact(tx, requestID, ev); err != nil {
+	// contact values are stored but only ever surface through the consent gate;
+	// if a governing scope is already revoked, the raw value is suppressed here
+	// so a late/retried event cannot resurrect it.
+	suppressed, err := projectContact(tx, requestID, ev)
+	if err != nil {
 		return res, err
+	}
+
+	// For every scope revoked by this event, erase only the raw/reversible data
+	// that scope governs, preserving non-reversible evidence. Idempotent.
+	erased := 0
+	for _, scope := range ev.ConsentRevokes {
+		n, err := eraseScopeData(tx, requestID, scope)
+		if err != nil {
+			return res, err
+		}
+		erased += n
 	}
 
 	if _, err := tx.Exec(`UPDATE canonical_request SET updated_seq = ? WHERE id = ?`, seq, requestID); err != nil {
@@ -101,6 +115,18 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 		if err := writeAudit(tx, now, key, ev.EventID, "CONSENT_REVOKED", joinSorted(ev.ConsentRevokes)); err != nil {
 			return res, err
 		}
+		// Record a non-reversible erasure summary (counts only, no raw values).
+		if err := writeAudit(tx, now, key, ev.EventID, "CONTACT_ERASED",
+			fmt.Sprintf("scopes=%s clearedItems=%d", joinSorted(ev.ConsentRevokes), erased)); err != nil {
+			return res, err
+		}
+	}
+	if suppressed {
+		// A late/retried event carried data governed by an already-revoked scope;
+		// it was withheld rather than persisted.
+		if err := writeAudit(tx, now, key, ev.EventID, "CONTACT_SUPPRESSED", "governing scope revoked; raw contact withheld"); err != nil {
+			return res, err
+		}
 	}
 
 	res.Status = model.StatusAccepted
@@ -117,14 +143,56 @@ func resolveEvent(tx *sql.Tx, ev *model.CanonicalEvent) (int64, string, bool, mo
 		if aliasKey == "" {
 			aliasKey = ev.RevokesEventID
 		}
+		// A revocation must land on the SAME converged request it withdraws
+		// consent from. Resolve through the alias index (a correlation number may
+		// be an alias of a fragment-keyed request) and, failing that, through the
+		// request that owns the referenced event. Only create a new request when
+		// neither exists, so a revocation never forks the chain.
+		if reqID, key, ok, err := revocationTarget(tx, aliasKey, ev.RevokesEventID); err != nil {
+			return 0, "", false, model.MatchDecision{}, err
+		} else if ok {
+			if err := attachAlias(tx, aliasKey, reqID); err != nil {
+				return 0, "", false, model.MatchDecision{}, err
+			}
+			return reqID, key, false, decision(key, "REVOCATION_TARGET", nil, nil, false), nil
+		}
 		reqID, key, created, err := createOrGetByKey(tx, aliasKey)
 		if err != nil {
 			return 0, "", false, model.MatchDecision{}, err
 		}
-		dec := decision(key, "REVOCATION_TARGET", nil, nil, created)
-		return reqID, key, created, dec, nil
+		return reqID, key, created, decision(key, "REVOCATION_TARGET", nil, nil, created), nil
 	}
 	return resolve(tx, ev)
+}
+
+// revocationTarget finds the request a revocation should apply to: first by the
+// alias/canonical key, then by the request that owns the referenced event id.
+func revocationTarget(tx *sql.Tx, aliasKey, revokesEventID string) (int64, string, bool, error) {
+	if aliasKey != "" {
+		var reqID int64
+		err := tx.QueryRow(`SELECT cr.id FROM canonical_request cr
+			WHERE cr.canonical_key = ?
+			   OR cr.id = (SELECT request_id FROM request_alias WHERE alias_key = ?)`, aliasKey, aliasKey).Scan(&reqID)
+		if err == nil {
+			key, kerr := canonicalKeyOf(tx, reqID)
+			return reqID, key, true, kerr
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, "", false, fmt.Errorf("revocation alias lookup: %w", err)
+		}
+	}
+	if revokesEventID != "" {
+		var reqID int64
+		err := tx.QueryRow(`SELECT request_id FROM event_link WHERE event_id = ? LIMIT 1`, revokesEventID).Scan(&reqID)
+		if err == nil {
+			key, kerr := canonicalKeyOf(tx, reqID)
+			return reqID, key, true, kerr
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, "", false, fmt.Errorf("revocation event lookup: %w", err)
+		}
+	}
+	return 0, "", false, nil
 }
 
 // recordMatchEvidence persists the deterministic match reason and confidence
@@ -188,26 +256,133 @@ func revokeConsent(tx *sql.Tx, requestID int64, scope string, seq int64) error {
 	return nil
 }
 
+// scopeState returns the current consent state for a scope ("GRANTED",
+// "REVOKED") and whether a row exists.
+func scopeState(tx *sql.Tx, requestID int64, scope string) (string, bool, error) {
+	var state string
+	err := tx.QueryRow(`SELECT state FROM consent WHERE request_id = ? AND scope = ?`, requestID, scope).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("load scope state: %w", err)
+	}
+	return state, true, nil
+}
+
+func scopeRevoked(tx *sql.Tx, requestID int64, scope string) (bool, error) {
+	state, ok, err := scopeState(tx, requestID, scope)
+	if err != nil {
+		return false, err
+	}
+	return ok && state == "REVOKED", nil
+}
+
+// contactMethodsGovernedBy lists the raw contact-method kinds whose exposure is
+// governed by a consent scope. Only CONTACT_CALLBACK governs raw phone/email
+// and the exact (reversible) callback window; other scopes govern no raw
+// contact data, so revoking them never touches contact info.
+func contactMethodsGovernedBy(scope string) []string {
+	switch scope {
+	case "CONTACT_CALLBACK":
+		return []string{identity.FragPhone, identity.FragEmail}
+	default:
+		return nil
+	}
+}
+
+// eraseScopeData removes only the original contact values / reversible digests
+// governed by a revoked scope, while preserving legitimate, non-reversible
+// event evidence (identity-fragment hashes, the coarse callback disposition,
+// match evidence, and the event chain). It is idempotent: a repeated revocation
+// erases nothing further. It returns the number of raw items cleared, for audit.
+func eraseScopeData(tx *sql.Tx, requestID int64, scope string) (int, error) {
+	methods := contactMethodsGovernedBy(scope)
+	if len(methods) == 0 {
+		return 0, nil
+	}
+	cleared := 0
+	for _, m := range methods {
+		r, err := tx.Exec(`DELETE FROM contact_method WHERE request_id = ? AND method = ?`, requestID, m)
+		if err != nil {
+			return 0, fmt.Errorf("erase contact method: %w", err)
+		}
+		if n, _ := r.RowsAffected(); n > 0 {
+			cleared += int(n)
+		}
+	}
+	// Null out the exact (reversible) callback window minutes but KEEP the coarse
+	// disposition bucket, which is non-reversible legitimate evidence.
+	r, err := tx.Exec(`UPDATE contact_detail SET callback_window_minutes = NULL
+		WHERE request_id = ? AND callback_window_minutes IS NOT NULL`, requestID)
+	if err != nil {
+		return 0, fmt.Errorf("erase callback window: %w", err)
+	}
+	if n, _ := r.RowsAffected(); n > 0 {
+		cleared += int(n)
+	}
+	return cleared, nil
+}
+
 // projectContact persists the callback window, its disposition, and any raw
 // contact methods. Raw values are stored for audit continuity but are only ever
-// emitted through the consent gate in GetCanonical.
-func projectContact(tx *sql.Tx, requestID int64, ev *model.CanonicalEvent) error {
+// emitted through the consent gate in GetCanonical. Crucially, if the scope
+// that governs a piece of raw contact data is already REVOKED, that raw value
+// is NOT re-stored — a late-arriving or retried event carrying revoked contact
+// info cannot resurrect it. The coarse callback disposition (non-reversible
+// evidence) is always recorded. It returns true if any raw value was suppressed
+// because its governing scope was revoked.
+func projectContact(tx *sql.Tx, requestID int64, ev *model.CanonicalEvent) (bool, error) {
+	callbackRevoked, err := scopeRevoked(tx, requestID, "CONTACT_CALLBACK")
+	if err != nil {
+		return false, err
+	}
+	suppressed := false
+
 	if ev.CallbackWindowMinutes != nil {
 		disp := identity.ClassifyWindow(*ev.CallbackWindowMinutes)
-		_, err := tx.Exec(`INSERT INTO contact_detail(request_id, callback_window_minutes, callback_disposition) VALUES(?,?,?)
-			ON CONFLICT(request_id) DO UPDATE SET callback_window_minutes=excluded.callback_window_minutes, callback_disposition=excluded.callback_disposition`,
-			requestID, *ev.CallbackWindowMinutes, disp)
-		if err != nil {
-			return fmt.Errorf("store contact detail: %w", err)
+		if callbackRevoked {
+			// Keep only the non-reversible disposition; never persist the exact
+			// (reversible) minute value against a revoked scope.
+			if _, err := tx.Exec(`INSERT INTO contact_detail(request_id, callback_disposition) VALUES(?,?)
+				ON CONFLICT(request_id) DO UPDATE SET callback_disposition=excluded.callback_disposition`,
+				requestID, disp); err != nil {
+				return false, fmt.Errorf("store contact disposition: %w", err)
+			}
+			suppressed = true
+		} else {
+			if _, err := tx.Exec(`INSERT INTO contact_detail(request_id, callback_window_minutes, callback_disposition) VALUES(?,?,?)
+				ON CONFLICT(request_id) DO UPDATE SET callback_window_minutes=excluded.callback_window_minutes, callback_disposition=excluded.callback_disposition`,
+				requestID, *ev.CallbackWindowMinutes, disp); err != nil {
+				return false, fmt.Errorf("store contact detail: %w", err)
+			}
 		}
 	}
+
 	for method, value := range ev.RawContacts {
+		// If this method's governing scope is revoked, drop the raw value.
+		governedRevoked := false
+		for _, gov := range []string{"CONTACT_CALLBACK"} {
+			for _, m := range contactMethodsGovernedBy(gov) {
+				if m == method {
+					if r, err := scopeRevoked(tx, requestID, gov); err != nil {
+						return false, err
+					} else if r {
+						governedRevoked = true
+					}
+				}
+			}
+		}
+		if governedRevoked {
+			suppressed = true
+			continue
+		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO contact_method(request_id, method, value) VALUES(?,?,?)`,
 			requestID, method, value); err != nil {
-			return fmt.Errorf("store contact method: %w", err)
+			return false, fmt.Errorf("store contact method: %w", err)
 		}
 	}
-	return nil
+	return suppressed, nil
 }
 
 // GetCanonical loads the fully projected canonical request for a key. The key

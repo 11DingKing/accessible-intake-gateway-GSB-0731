@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -87,6 +88,27 @@ func splitList(s string) []string {
 		return nil
 	}
 	return strings.Split(s, ",")
+}
+
+// RawStoredContact reveals what raw contact data is actually persisted for a
+// request, bypassing the consent gate. It exists so callers (and tests) can
+// verify that revoked data is truly erased from storage, not merely hidden by
+// the projection. It returns the count of stored contact-method rows and
+// whether the exact (reversible) callback-window minute value is still stored.
+func (s *Store) RawStoredContact(canonicalKey string) (methodRows int, windowStored bool, err error) {
+	var reqID int64
+	e := s.db.QueryRow(`SELECT cr.id FROM canonical_request cr
+		WHERE cr.canonical_key = ?
+		   OR cr.id = (SELECT request_id FROM request_alias WHERE alias_key = ?)`, canonicalKey, canonicalKey).Scan(&reqID)
+	if e != nil {
+		return 0, false, fmt.Errorf("resolve request: %w", e)
+	}
+	if e := s.db.QueryRow(`SELECT COUNT(*) FROM contact_method WHERE request_id = ?`, reqID).Scan(&methodRows); e != nil {
+		return 0, false, e
+	}
+	var win sql.NullInt64
+	_ = s.db.QueryRow(`SELECT callback_window_minutes FROM contact_detail WHERE request_id = ?`, reqID).Scan(&win)
+	return methodRows, win.Valid, nil
 }
 
 // digest computes a deterministic fingerprint over the normalized result and

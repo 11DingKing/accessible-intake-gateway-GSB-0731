@@ -123,8 +123,13 @@ func TestContactHiddenUntilConsent(t *testing.T) {
 	if req3.Contact.Exposed || len(req3.Contact.Methods) != 0 || req3.Contact.CallbackWindowMinutes != nil {
 		t.Fatalf("contact must be withheld after revocation: %+v", req3.Contact)
 	}
-	if !req3.Contact.HasPendingContact {
-		t.Fatalf("pending flag should remain true (data still held, just gated)")
+	// Round 3: revocation ERASES the raw contact data (not merely gates it), so
+	// there is no pending contact left; the non-reversible disposition remains.
+	if req3.Contact.HasPendingContact {
+		t.Fatalf("raw contact should be erased after revocation, not merely gated: %+v", req3.Contact)
+	}
+	if req3.Contact.CallbackDisposition != "IMMEDIATE" {
+		t.Fatalf("non-reversible disposition evidence should be preserved: %+v", req3.Contact)
 	}
 }
 
