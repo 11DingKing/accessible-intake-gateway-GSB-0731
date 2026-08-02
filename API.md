@@ -126,6 +126,11 @@ Returns the projected request plus the append-only `attempts` log, the
 attempt/audit history with volatile timestamps and row ids excluded, so
 replaying the same batch into a fresh database yields the same digest.
 
+### `GET /v1/requests/{key}/match-evidence` — identity resolution evidence
+
+Returns the deterministic `MatchDecision` for every event bound to the request,
+ordered by chain position (see *Identity resolution* below).
+
 ### `GET /v1/events/{id}/attempts` — attempt history for one event
 
 Every processing attempt (including retries) in order.
@@ -133,6 +138,89 @@ Every processing attempt (including retries) in order.
 ### `GET /healthz`
 
 Liveness plus the loaded `canonicalVersion`.
+
+---
+
+## Identity resolution (hotline callbacks)
+
+A hotline callback may arrive **before** the web submission that first carries a
+correlation number, and may bring identity fragments that partly match and
+partly conflict with an existing request. Resolution is deterministic and always
+converges to **one** canonical chain.
+
+### Fragments
+
+Supply corroborating identity signals under an `identity` object; the source
+correlation number is `canonicalKey` (or `correlation`):
+
+```json
+{
+  "eventId": "EV-H-CALL", "channel": "HOTLINE", "callRef": "C-900",
+  "callbackWindowMinutes": 30,
+  "identity": {"phone": "+1 (415) 555-0100", "email": "Jamie@Example.com"}
+}
+```
+
+| Fragment      | Weight | Unique | Sensitive | Notes                                   |
+|---------------|--------|--------|-----------|-----------------------------------------|
+| `correlation` | 1.0    | yes    | no        | the source correlation number (decisive)|
+| `phone`       | 0.5    | no     | **yes**   | matched by hash; raw value consent-gated |
+| `email`       | 0.5    | no     | **yes**   | matched by hash; raw value consent-gated |
+| `dob`         | 0.4    | no     | no        |                                         |
+| `familyName`  | 0.25   | no     | no        |                                         |
+| `givenName`   | 0.2    | no     | no        |                                         |
+| `postalCode`  | 0.15   | no     | no        |                                         |
+
+### Match reasons & confidence
+
+Each accepted event carries a `match` decision in its result and is persisted as
+evidence. Confidence is `HIGH` when the correlation number matches or the summed
+fragment weight ≥ 0.7, `MEDIUM` ≥ 0.4, else `LOW`.
+
+| Reason                        | Meaning                                                                 |
+|-------------------------------|-------------------------------------------------------------------------|
+| `CORRELATION_MATCH`           | Correlation number resolved to an existing request (decisive).          |
+| `CORROBORATED_MATCH`          | A new correlation / fragment-only event bound to an existing request via shared fragments. |
+| `NEW_CORRELATION`             | Brand-new correlation number, no corroboration → new request.           |
+| `NEW_FRAGMENTS`               | Fragment-only event (e.g. early callback), nothing matched → new request keyed by a synthetic `frag:` key. |
+| `UNIQUE_CONFLICT_NEW_REQUEST` | Shared corroborating fragment but a **different** unique correlation → kept separate; the shared fragment is recorded in `conflictingOn`. |
+| `AMBIGUOUS_MATCH`             | Fragments point at multiple requests → bound to the earliest, others recorded as conflict evidence. |
+| `CHANNEL_SOURCE_FALLBACK`     | No identity signals → Round 1 `channel:sourceId` keying.                |
+| `REVOCATION_TARGET`           | A revocation resolved to the request it withdraws consent from.         |
+
+### One chain under out-of-order / concurrency / retry
+
+- A **fragment ownership index** (`identity_fragment`, `frag_hash` primary key)
+  means the first writer to claim a correlation number or fragment owns it;
+  every later event carrying that signal resolves to the same request.
+- An **alias index** (`request_alias`) lets a correlation number attach to a
+  request that was created earlier from fragments alone, so the early callback
+  and the later web build share **one** chain. Reads accept the canonical key or
+  any alias.
+- All writes serialize through a single SQLite connection, so concurrent claims
+  from two channels and adapter-failure retries can never fork a second chain.
+- Two different unique correlation numbers are **never merged**, even when they
+  share a weak fragment — that is surfaced as `conflictingOn` evidence.
+
+### Callback-window dispositions
+
+The minute unit from Round 1 is unchanged. Negative values are `REJECTED`;
+otherwise the window is classified (the disposition is non-identifying and shown
+even before consent):
+
+| Minutes    | `callbackDisposition` |
+|------------|-----------------------|
+| `0`        | `IMMEDIATE`           |
+| `1…1439`   | `INTRADAY`            |
+| `≥ 1440`   | `CROSS_DAY`           |
+
+### Contact info is consent-gated
+
+Raw contact methods (`phone`/`email`) and the raw `callbackWindowMinutes` are
+returned **only** while `CONTACT_CALLBACK` is effective. Before consent — or
+after a sticky revocation — the projection shows only
+`hasPendingContact: true` and the non-identifying disposition; the raw values
+are never emitted, including on retries or replays.
 
 ---
 
@@ -175,14 +263,19 @@ success. Non-transient downstream errors are terminal (`REJECTED`).
   `IF NOT EXISTS`, so opening a fresh or existing database always converges to
   the same shape without data loss.
 - **Tables:** `canonical_request`, `event_link`, `accommodation`, `consent`,
-  `contact_detail`, `idempotency`, `attempt`, `audit_entry`.
+  `contact_detail`, `contact_method`, `request_alias`, `identity_fragment`,
+  `match_evidence`, `idempotency`, `attempt`, `audit_entry`.
 - **Retention decisions:**
   - `attempt` and `audit_entry` are **append-only** — the full history of every
     attempt and canonical change is retained for audit and stable replay.
-  - `contact_detail` holds only the minute-based callback window and is
-    **projected out** (not returned) once `CONTACT_CALLBACK` is revoked, so
-    withdrawn contact data is not re-exposed even though the raw row is kept for
-    audit continuity.
+  - `contact_detail` (callback window/disposition) and `contact_method` (raw
+    phone/email) hold contact data but are **projected through the consent
+    gate**: raw values are withheld before `CONTACT_CALLBACK` and after a sticky
+    revocation, even though the rows are kept for audit continuity.
+  - `identity_fragment` keeps only **hashes** of identity signals; raw sensitive
+    values never enter the fragment index, match evidence, or the audit trail.
+  - `request_alias` and `match_evidence` retain how each event resolved, so the
+    match reasoning is replayable and auditable.
   - The `idempotency` ledger retains one row per `(eventId, payloadHash)` so
     results stay stable and conflicts remain detectable indefinitely.
   - `*.db`, `*.sqlite*`, and `coverage.out` are git-ignored; the database is
@@ -196,8 +289,9 @@ success. Non-transient downstream errors are terminal (`REJECTED`).
 cmd/server/            HTTP entrypoint (stdlib, graceful shutdown)
 internal/contract/     loads & validates channel-contracts.json
 internal/model/        canonical request domain types
+internal/identity/     deterministic match policy (fragments, scoring, windows)
 internal/normalize/    channel envelopes -> canonical events (pure, deterministic)
-internal/store/        SQLite persistence, idempotency, convergence, projections
+internal/store/        SQLite persistence, identity resolution, convergence, projections
 internal/httpapi/      net/http mux, request/response encoding
 materials/             channel-contracts.json fixture (source of truth)
 ```

@@ -31,6 +31,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/intake/events", s.handleSubmit)
 	s.mux.HandleFunc("GET /v1/requests/{key}", s.handleGetRequest)
 	s.mux.HandleFunc("GET /v1/requests/{key}/summary", s.handleGetSummary)
+	s.mux.HandleFunc("GET /v1/requests/{key}/match-evidence", s.handleGetEvidence)
 	s.mux.HandleFunc("GET /v1/events/{id}/attempts", s.handleGetAttempts)
 }
 
@@ -113,6 +114,16 @@ func (s *Server) handleGetSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sum)
+}
+
+func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	evidence, err := s.svc.Store().MatchEvidence(key)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"canonicalKey": key, "matchEvidence": evidence})
 }
 
 func (s *Server) handleGetAttempts(w http.ResponseWriter, r *http.Request) {

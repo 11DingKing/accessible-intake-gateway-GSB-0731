@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"github.com/accessible-intake-gateway/internal/contract"
+	"github.com/accessible-intake-gateway/internal/identity"
 	"github.com/accessible-intake-gateway/internal/model"
 )
 
@@ -135,7 +136,10 @@ func Normalize(c *contract.Contract, raw []byte) (*model.CanonicalEvent, []model
 		ev.ConsentGrants = grants
 	}
 
-	// Minute-based callback window (hotline). Preserve the contract's field name.
+	// Minute-based callback window (hotline). Preserve the contract's field
+	// name and minute unit established in Round 1. Zero is valid (call back
+	// immediately); negative is rejected; large values spanning a day are valid
+	// but classified distinctly downstream.
 	if rawWin, ok := fields[ch.CallbackWindowField]; ok && ch.CallbackWindowField != "" {
 		var win int
 		if err := json.Unmarshal(rawWin, &win); err != nil {
@@ -147,15 +151,81 @@ func Normalize(c *contract.Contract, raw []byte) (*model.CanonicalEvent, []model
 		}
 	}
 
-	// Canonical key correlates events across channels for one applicant. Callers
-	// supply it as the cross-channel correlation number; when absent the event
-	// forms its own single-event request keyed by channel + source id.
+	// Extract identity fragments (source correlation number + corroborating
+	// signals) used for deterministic matching. Sensitive fragments are hashed
+	// and their raw values held separately for consent-gated projection.
+	extractFragments(ev, fields, add)
+
+	// Canonical key correlates events across channels for one applicant. The
+	// caller-supplied correlation number is authoritative when present; when
+	// absent, the store resolves the request from corroborating fragments (see
+	// store.resolveCanonicalKey), falling back to channel + source id only when
+	// nothing matches. Leaving CanonicalKey empty here signals "resolve me".
 	ev.CanonicalKey = decodeString(fields["canonicalKey"])
-	if ev.CanonicalKey == "" {
-		ev.CanonicalKey = ev.Channel + ":" + ev.SourceID
-	}
 
 	return ev, errs
+}
+
+// extractFragments pulls identity fragments from the envelope. Recognized
+// sources: the correlation number (canonicalKey/correlation) and an optional
+// "identity" object with phone, email, dob, givenName, familyName, postalCode.
+// Sensitive fragments (phone/email) contribute only a hash to the event's
+// fragment list; their plaintext is stashed in RawContacts for the
+// consent-gated contact projection and never enters evidence or the audit log.
+func extractFragments(ev *model.CanonicalEvent, fields map[string]json.RawMessage, add func(field, code, msg string)) {
+	seen := map[string]struct{}{}
+	addFrag := func(fragType, value string) {
+		if value == "" {
+			return
+		}
+		spec, ok := identity.Lookup(fragType)
+		if !ok {
+			return
+		}
+		if _, dup := seen[fragType]; dup {
+			return
+		}
+		seen[fragType] = struct{}{}
+		frag := model.IdentityFragment{
+			Type:      fragType,
+			Hash:      identity.Hash(fragType, value),
+			Unique:    spec.Unique,
+			Sensitive: spec.Sensitive,
+		}
+		if spec.Sensitive {
+			if ev.RawContacts == nil {
+				ev.RawContacts = map[string]string{}
+			}
+			ev.RawContacts[fragType] = identity.Normalize(fragType, value)
+		} else {
+			frag.Value = identity.Normalize(fragType, value)
+		}
+		ev.Fragments = append(ev.Fragments, frag)
+	}
+
+	// The correlation number can be supplied at the top level as canonicalKey or
+	// correlation; both denote the source correlation number.
+	if v := decodeString(fields["canonicalKey"]); v != "" {
+		addFrag(identity.FragCorrelation, v)
+	} else if v := decodeString(fields["correlation"]); v != "" {
+		addFrag(identity.FragCorrelation, v)
+	}
+
+	if rawID, ok := fields["identity"]; ok {
+		var idObj map[string]json.RawMessage
+		if err := json.Unmarshal(rawID, &idObj); err != nil {
+			add("identity", CodeInvalidValue, "identity must be an object of fragments")
+			return
+		}
+		for _, fragType := range []string{
+			identity.FragPhone, identity.FragEmail, identity.FragDOB,
+			identity.FragGivenName, identity.FragFamilyName, identity.FragPostalCode,
+		} {
+			if v := decodeString(idObj[fragType]); v != "" {
+				addFrag(fragType, v)
+			}
+		}
+	}
 }
 
 func decodeString(raw json.RawMessage) string {

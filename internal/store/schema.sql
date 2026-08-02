@@ -50,7 +50,55 @@ CREATE TABLE IF NOT EXISTS consent (
 -- Callback contact detail, exposed only while CONTACT_CALLBACK is effective.
 CREATE TABLE IF NOT EXISTS contact_detail (
     request_id              INTEGER PRIMARY KEY REFERENCES canonical_request(id),
-    callback_window_minutes INTEGER
+    callback_window_minutes INTEGER,
+    callback_disposition    TEXT
+);
+
+-- Raw contact methods (phone/email) held for a request. These are the original
+-- contact values; they are NEVER emitted before CONTACT_CALLBACK consent is
+-- effective, and never after it is revoked (sticky). Kept for audit continuity
+-- but always projected through the consent gate.
+CREATE TABLE IF NOT EXISTS contact_method (
+    request_id INTEGER NOT NULL REFERENCES canonical_request(id),
+    method     TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    UNIQUE (request_id, method)
+);
+
+-- Alias index: every key a request is known by (its canonical key plus any
+-- correlation numbers later attached to it) maps to the one request. Resolution
+-- and reads go through this table, so a correlation number that arrives after a
+-- fragment-only request was created still lands on the same single chain.
+CREATE TABLE IF NOT EXISTS request_alias (
+    alias_key  TEXT PRIMARY KEY,
+    request_id INTEGER NOT NULL REFERENCES canonical_request(id)
+);
+
+-- Identity fragment ownership index. frag_hash is the PRIMARY KEY, so the first
+-- request to claim a fragment owns it; a later event carrying the same fragment
+-- deterministically resolves to that request. This is what makes out-of-order,
+-- concurrent, and retried claims converge to a single chain.
+CREATE TABLE IF NOT EXISTS identity_fragment (
+    frag_hash  TEXT PRIMARY KEY,
+    request_id INTEGER NOT NULL REFERENCES canonical_request(id),
+    frag_type  TEXT NOT NULL,
+    is_unique  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Deterministic match evidence per event: which request it bound to, the match
+-- reason, confidence label/score, and the fragment types matched or conflicted.
+-- No raw contact values are stored here.
+CREATE TABLE IF NOT EXISTS match_evidence (
+    event_id       TEXT PRIMARY KEY,
+    request_id     INTEGER NOT NULL REFERENCES canonical_request(id),
+    canonical_key  TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    confidence     TEXT NOT NULL,
+    score          REAL NOT NULL,
+    matched_on     TEXT,
+    conflicting_on TEXT,
+    new_request    INTEGER NOT NULL DEFAULT 0,
+    at             TEXT NOT NULL
 );
 
 -- Idempotency ledger: one row per (event_id, payload_hash). A repeated event
@@ -90,3 +138,5 @@ CREATE TABLE IF NOT EXISTS audit_entry (
 CREATE INDEX IF NOT EXISTS idx_event_link_request ON event_link(request_id);
 CREATE INDEX IF NOT EXISTS idx_attempt_event ON attempt(event_id);
 CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_entry(canonical_key);
+CREATE INDEX IF NOT EXISTS idx_alias_request ON request_alias(request_id);
+CREATE INDEX IF NOT EXISTS idx_fragment_request ON identity_fragment(request_id);

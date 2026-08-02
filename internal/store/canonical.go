@@ -6,20 +6,28 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/accessible-intake-gateway/internal/identity"
 	"github.com/accessible-intake-gateway/internal/model"
 )
 
 // applyCanonical converges one valid event into its canonical request within
-// the current transaction. It creates the request on first sight, appends to
-// the event chain exactly once, merges accommodations, and updates the consent
-// ledger with sticky-revocation semantics.
+// the current transaction. It resolves the event to exactly one request
+// (creating one only when nothing matches), appends to the event chain exactly
+// once, merges accommodations, updates the consent ledger with sticky-revocation
+// semantics, and records deterministic match evidence.
 func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEvent) (model.RecordResult, error) {
-	res := model.RecordResult{EventID: ev.EventID, Channel: ev.Channel, AttemptNo: attemptNo, CanonicalKey: ev.CanonicalKey}
+	res := model.RecordResult{EventID: ev.EventID, Channel: ev.Channel, AttemptNo: attemptNo}
 
-	requestID, created, err := upsertRequest(tx, now, ev)
+	requestID, key, created, dec, err := resolveEvent(tx, ev)
 	if err != nil {
 		return res, err
 	}
+	res.CanonicalKey = key
+	// Bind the event's canonical key to the resolved request so downstream
+	// projections and audit entries agree on one identity.
+	ev.CanonicalKey = key
+	d := dec
+	res.Match = &d
 
 	// Append to the event chain. The UNIQUE(request_id, event_id) constraint
 	// makes concurrent submissions converge to a single chain: the second
@@ -30,6 +38,11 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 		return res, fmt.Errorf("append event link: %w", err)
 	}
 	seq, _ := currentSeq(tx)
+
+	// Record deterministic match evidence (no raw contact values).
+	if err := recordMatchEvidence(tx, now, ev.EventID, requestID, dec); err != nil {
+		return res, err
+	}
 
 	// Merge accommodations (set semantics).
 	for _, code := range ev.Accommodations {
@@ -55,7 +68,8 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 		}
 	}
 
-	// Re-project the callback contact detail from the effective consent state.
+	// Persist the callback window/disposition and any raw contact methods. Raw
+	// contact values are stored but only ever surface through the consent gate.
 	if err := projectContact(tx, requestID, ev); err != nil {
 		return res, err
 	}
@@ -65,21 +79,26 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 	}
 
 	action := "EVENT_APPENDED"
-	detail := fmt.Sprintf("channel=%s kind=%s", ev.Channel, ev.Kind)
+	detail := fmt.Sprintf("channel=%s kind=%s match=%s conf=%s", ev.Channel, ev.Kind, dec.Reason, dec.Confidence)
 	if n, _ := linkRes.RowsAffected(); n == 0 {
 		action = "EVENT_CONVERGED"
 		detail += " (chain already contained this event)"
 	}
 	if created {
-		if err := writeAudit(tx, now, ev.CanonicalKey, ev.EventID, "REQUEST_CREATED", fmt.Sprintf("version=%s", ev.CanonicalKey)); err != nil {
+		if err := writeAudit(tx, now, key, ev.EventID, "REQUEST_CREATED", fmt.Sprintf("version=%s", key)); err != nil {
 			return res, err
 		}
 	}
-	if err := writeAudit(tx, now, ev.CanonicalKey, ev.EventID, action, detail); err != nil {
+	if err := writeAudit(tx, now, key, ev.EventID, action, detail); err != nil {
 		return res, err
 	}
+	if len(dec.ConflictingOn) > 0 {
+		if err := writeAudit(tx, now, key, ev.EventID, "IDENTITY_CONFLICT", "conflictingOn="+joinSorted(dec.ConflictingOn)); err != nil {
+			return res, err
+		}
+	}
 	if len(ev.ConsentRevokes) > 0 {
-		if err := writeAudit(tx, now, ev.CanonicalKey, ev.EventID, "CONSENT_REVOKED", joinSorted(ev.ConsentRevokes)); err != nil {
+		if err := writeAudit(tx, now, key, ev.EventID, "CONSENT_REVOKED", joinSorted(ev.ConsentRevokes)); err != nil {
 			return res, err
 		}
 	}
@@ -88,27 +107,44 @@ func applyCanonical(tx *sql.Tx, now string, attemptNo int, ev *model.CanonicalEv
 	return res, nil
 }
 
-// upsertRequest returns the request id for the event's canonical key, creating
-// the request if it does not yet exist. INSERT OR IGNORE + re-select makes the
-// create safe under concurrency.
-func upsertRequest(tx *sql.Tx, now string, ev *model.CanonicalEvent) (int64, bool, error) {
-	version := "intake.v1"
-	seq, _ := currentSeq(tx)
-	r, err := tx.Exec(`INSERT OR IGNORE INTO canonical_request(canonical_key, version, created_seq, updated_seq) VALUES(?,?,?,?)`,
-		ev.CanonicalKey, version, seq+1, seq+1)
+// resolveEvent binds an event to a canonical request. Revocations resolve by
+// their target correlation number (via the alias index) so a withdrawal lands
+// on the same request it references; standard events use full identity
+// resolution.
+func resolveEvent(tx *sql.Tx, ev *model.CanonicalEvent) (int64, string, bool, model.MatchDecision, error) {
+	if ev.Kind == model.KindRevocation {
+		aliasKey := ev.CanonicalKey
+		if aliasKey == "" {
+			aliasKey = ev.RevokesEventID
+		}
+		reqID, key, created, err := createOrGetByKey(tx, aliasKey)
+		if err != nil {
+			return 0, "", false, model.MatchDecision{}, err
+		}
+		dec := decision(key, "REVOCATION_TARGET", nil, nil, created)
+		return reqID, key, created, dec, nil
+	}
+	return resolve(tx, ev)
+}
+
+// recordMatchEvidence persists the deterministic match reason and confidence
+// evidence for an event. It is idempotent per event id.
+func recordMatchEvidence(tx *sql.Tx, now, eventID string, requestID int64, dec model.MatchDecision) error {
+	_, err := tx.Exec(`INSERT OR IGNORE INTO match_evidence(event_id, request_id, canonical_key, reason, confidence, score, matched_on, conflicting_on, new_request, at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		eventID, requestID, dec.CanonicalKey, dec.Reason, dec.Confidence, dec.Score,
+		nullStr(joinSorted(dec.MatchedOn)), nullStr(joinSorted(dec.ConflictingOn)), boolInt(dec.NewRequest), now)
 	if err != nil {
-		return 0, false, fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("record match evidence: %w", err)
 	}
-	var id int64
-	err = tx.QueryRow(`SELECT id FROM canonical_request WHERE canonical_key = ?`, ev.CanonicalKey).Scan(&id)
-	if err != nil {
-		return 0, false, fmt.Errorf("load request id: %w", err)
+	return nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
 	}
-	created := false
-	if n, _ := r.RowsAffected(); n > 0 {
-		created = true
-	}
-	return id, created, nil
+	return 0
 }
 
 // currentSeq returns a monotonically increasing sequence sourced from the
@@ -152,26 +188,39 @@ func revokeConsent(tx *sql.Tx, requestID int64, scope string, seq int64) error {
 	return nil
 }
 
-// projectContact exposes the callback window only while CONTACT_CALLBACK is
-// effective. If the scope is revoked, the stored detail is cleared so a retry
-// cannot re-expose it.
+// projectContact persists the callback window, its disposition, and any raw
+// contact methods. Raw values are stored for audit continuity but are only ever
+// emitted through the consent gate in GetCanonical.
 func projectContact(tx *sql.Tx, requestID int64, ev *model.CanonicalEvent) error {
 	if ev.CallbackWindowMinutes != nil {
-		_, err := tx.Exec(`INSERT INTO contact_detail(request_id, callback_window_minutes) VALUES(?,?)
-			ON CONFLICT(request_id) DO UPDATE SET callback_window_minutes=excluded.callback_window_minutes`,
-			requestID, *ev.CallbackWindowMinutes)
+		disp := identity.ClassifyWindow(*ev.CallbackWindowMinutes)
+		_, err := tx.Exec(`INSERT INTO contact_detail(request_id, callback_window_minutes, callback_disposition) VALUES(?,?,?)
+			ON CONFLICT(request_id) DO UPDATE SET callback_window_minutes=excluded.callback_window_minutes, callback_disposition=excluded.callback_disposition`,
+			requestID, *ev.CallbackWindowMinutes, disp)
 		if err != nil {
 			return fmt.Errorf("store contact detail: %w", err)
+		}
+	}
+	for method, value := range ev.RawContacts {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO contact_method(request_id, method, value) VALUES(?,?,?)`,
+			requestID, method, value); err != nil {
+			return fmt.Errorf("store contact method: %w", err)
 		}
 	}
 	return nil
 }
 
-// GetCanonical loads the fully projected canonical request for a key.
+// GetCanonical loads the fully projected canonical request for a key. The key
+// may be the request's own canonical key or any correlation alias attached to
+// it, so a caller who only knows one channel's correlation number still reaches
+// the single converged request.
 func (s *Store) GetCanonical(canonicalKey string) (model.CanonicalRequest, bool, error) {
 	var req model.CanonicalRequest
 	var id int64
-	err := s.db.QueryRow(`SELECT id, canonical_key, version, created_seq, updated_seq FROM canonical_request WHERE canonical_key = ?`, canonicalKey).
+	err := s.db.QueryRow(`SELECT cr.id, cr.canonical_key, cr.version, cr.created_seq, cr.updated_seq
+		FROM canonical_request cr
+		WHERE cr.canonical_key = ?
+		   OR cr.id = (SELECT request_id FROM request_alias WHERE alias_key = ?)`, canonicalKey, canonicalKey).
 		Scan(&id, &req.CanonicalKey, &req.Version, &req.CreatedSeq, &req.UpdatedSeq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return req, false, nil
@@ -227,15 +276,31 @@ func (s *Store) GetCanonical(canonicalKey string) (model.CanonicalRequest, bool,
 	sort.Strings(req.EffectiveConsent)
 	sort.Strings(req.RevokedConsent)
 
-	// Contact projection: expose the callback window only if CONTACT_CALLBACK is effective.
+	// Contact projection. The callback disposition is non-identifying and always
+	// shown; the raw callback window and contact methods (phone/email) are
+	// emitted ONLY while CONTACT_CALLBACK is effective. Before consent — or after
+	// a sticky revocation — only HasPendingContact signals that details exist.
 	req.Contact = model.ContactProjection{Exposed: contactEffective}
+	var win sql.NullInt64
+	var disp sql.NullString
+	_ = s.db.QueryRow(`SELECT callback_window_minutes, callback_disposition FROM contact_detail WHERE request_id = ?`, id).Scan(&win, &disp)
+	if disp.Valid {
+		req.Contact.CallbackDisposition = disp.String
+	}
+	methods, err := s.stringList(`SELECT method FROM contact_method WHERE request_id = ? ORDER BY method`, id)
+	if err != nil {
+		return req, false, err
+	}
+	hasRaw := win.Valid || len(methods) > 0
 	if contactEffective {
-		var win sql.NullInt64
-		err := s.db.QueryRow(`SELECT callback_window_minutes FROM contact_detail WHERE request_id = ?`, id).Scan(&win)
-		if err == nil && win.Valid {
+		if win.Valid {
 			v := int(win.Int64)
 			req.Contact.CallbackWindowMinutes = &v
 		}
+		req.Contact.Methods = methods
+	} else {
+		// Consent not confirmed (or revoked): withhold raw contact info.
+		req.Contact.HasPendingContact = hasRaw
 	}
 	return req, true, nil
 }

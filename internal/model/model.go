@@ -58,20 +58,56 @@ type CanonicalEvent struct {
 	// pointer so that "absent" is distinguishable from an explicit zero.
 	CallbackWindowMinutes *int `json:"callbackWindowMinutes,omitempty"`
 
+	// Fragments are the normalized identity fragments carried by this event
+	// (source correlation number, phone, email, name parts, etc.). They drive
+	// deterministic matching to an existing canonical request. Sensitive
+	// fragments store only a hash here; raw contact values live in RawContacts
+	// and are never persisted or exposed before consent.
+	Fragments []IdentityFragment `json:"fragments,omitempty"`
+
+	// RawContacts holds the plaintext of sensitive fragments (phone/email),
+	// keyed by fragment type. It is used only to populate the consent-gated
+	// contact projection and is never written to the audit trail or evidence.
+	RawContacts map[string]string `json:"-"`
+
 	// PayloadHash is a canonical digest of the raw envelope used for idempotency.
 	PayloadHash string `json:"payloadHash"`
 }
 
+// IdentityFragment is one normalized identity signal on an event.
+type IdentityFragment struct {
+	Type      string `json:"type"`
+	Hash      string `json:"hash"`
+	Unique    bool   `json:"unique"`
+	Sensitive bool   `json:"sensitive"`
+	// Value carries the plaintext only for non-sensitive fragments; sensitive
+	// fragments leave it empty so raw contact data is never surfaced.
+	Value string `json:"value,omitempty"`
+}
+
+// MatchDecision is the deterministic resolution outcome for an event: which
+// canonical request it bound to, why, and with what confidence evidence.
+type MatchDecision struct {
+	CanonicalKey  string   `json:"canonicalKey"`
+	Reason        string   `json:"reason"`
+	Confidence    string   `json:"confidence"`
+	Score         float64  `json:"score"`
+	MatchedOn     []string `json:"matchedOn,omitempty"`
+	ConflictingOn []string `json:"conflictingOn,omitempty"`
+	NewRequest    bool     `json:"newRequest"`
+}
+
 // RecordResult is the outcome returned to the caller for one submitted event.
 type RecordResult struct {
-	EventID      string        `json:"eventId"`
-	Channel      string        `json:"channel"`
-	Status       Status        `json:"status"`
-	CanonicalKey string        `json:"canonicalKey,omitempty"`
-	Duplicate    bool          `json:"duplicate,omitempty"`
-	Retriable    bool          `json:"retriable,omitempty"`
-	AttemptNo    int           `json:"attemptNo"`
-	Errors       []RecordError `json:"errors,omitempty"`
+	EventID      string         `json:"eventId"`
+	Channel      string         `json:"channel"`
+	Status       Status         `json:"status"`
+	CanonicalKey string         `json:"canonicalKey,omitempty"`
+	Duplicate    bool           `json:"duplicate,omitempty"`
+	Retriable    bool           `json:"retriable,omitempty"`
+	AttemptNo    int            `json:"attemptNo"`
+	Match        *MatchDecision `json:"match,omitempty"`
+	Errors       []RecordError  `json:"errors,omitempty"`
 }
 
 // ChainLink is one accepted event within a canonical request's event chain.
@@ -84,11 +120,18 @@ type ChainLink struct {
 	SourceID      string    `json:"sourceId"`
 }
 
-// ContactProjection carries contact/callback details that are only exposed
-// while the CONTACT_CALLBACK consent scope is effective.
+// ContactProjection carries contact/callback details. Raw contact methods and
+// the callback window are exposed only while the CONTACT_CALLBACK consent scope
+// is effective; before consent, only the non-identifying disposition and a
+// masked availability flag are shown.
 type ContactProjection struct {
-	Exposed               bool `json:"exposed"`
-	CallbackWindowMinutes *int `json:"callbackWindowMinutes,omitempty"`
+	Exposed               bool     `json:"exposed"`
+	CallbackWindowMinutes *int     `json:"callbackWindowMinutes,omitempty"`
+	CallbackDisposition   string   `json:"callbackDisposition,omitempty"`
+	// HasPendingContact reports that raw contact info is held but withheld
+	// pending consent. It carries no identifying value.
+	HasPendingContact bool     `json:"hasPendingContact,omitempty"`
+	Methods           []string `json:"methods,omitempty"`
 }
 
 // CanonicalRequest is the normalized aggregate for a single applicant/request,
@@ -133,6 +176,7 @@ type AuditSummary struct {
 	Request       CanonicalRequest `json:"request"`
 	Attempts      []Attempt        `json:"attempts"`
 	Entries       []AuditEntry     `json:"auditTrail"`
+	MatchEvidence []MatchDecision  `json:"matchEvidence"`
 	AcceptedCount int              `json:"acceptedCount"`
 	Digest        string           `json:"digest"`
 }
