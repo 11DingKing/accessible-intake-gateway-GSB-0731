@@ -176,8 +176,14 @@ func Validate(n NormalizedEvent, c *contracts.Contracts) (results []ItemResult, 
 		}
 	}
 	if n.CallbackWindow != nil {
-		if *n.CallbackWindow < 0 {
-			add("callbackWindowMinutes", ItemInvalidValue, "callbackWindowMinutes must be zero or positive")
+		windowStatus, _, result := ClassifyCallbackWindow(n.CallbackWindow)
+		switch windowStatus {
+		case WindowNegativeRejected:
+			add(result.Item, result.Code, result.Message)
+		case WindowCrossDayRejected:
+			add(result.Item, result.Code, result.Message)
+		case WindowZero, WindowOK:
+			// Valid: zero means ASAP, positive within 24h is accepted.
 		}
 	}
 	return results, false

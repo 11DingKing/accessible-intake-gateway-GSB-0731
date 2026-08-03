@@ -35,7 +35,98 @@ const (
 	ItemUnknownScope      = "UNKNOWN_SCOPE"
 	ItemUnknownChannel    = "UNKNOWN_CHANNEL"
 	ItemRevocationTarget  = "REVOCATION_TARGET_MISSING"
+	ItemCrossDayWindow    = "CROSS_DAY_WINDOW"
 )
+
+// CallbackWindowMinutes is the unit declared by the fixture (round 1).
+// Window values are always interpreted in minutes.
+const (
+	CallbackWindowUnit        = "MINUTES"
+	MaxCallbackWindowMinutes  = 1440 // 24 hours; >= this is a cross-day window
+)
+
+// Callback window validation outcomes.
+const (
+	WindowOK               = "OK"
+	WindowZero             = "ZERO"
+	WindowNegativeRejected = "NEGATIVE_REJECTED"
+	WindowCrossDayRejected = "CROSS_DAY_REJECTED"
+	WindowAbsent           = "ABSENT"
+)
+
+// Candidate match statuses.
+const (
+	MatchLinked   = "LINKED"
+	MatchPending  = "PENDING"
+	MatchConflict = "CONFLICT"
+)
+
+// Confidence levels for candidate normalization.
+const (
+	ConfidenceHigh   = "HIGH"
+	ConfidenceMedium = "MEDIUM"
+	ConfidenceLow    = "LOW"
+	ConfidenceNone   = "NONE"
+)
+
+// Deterministic match reason codes.
+const (
+	ReasonReferenceExact   = "REFERENCE_EXACT_MATCH"
+	ReasonPhoneExact       = "PHONE_EXACT_MATCH"
+	ReasonEmailExact       = "EMAIL_EXACT_MATCH"
+	ReasonNameExact        = "NAME_EXACT_MATCH"
+	ReasonIdentityConflict = "IDENTITY_FRAGMENT_CONFLICT"
+)
+
+// IdentityFragment holds the normalized identifiers used for candidate
+// matching. All values are pre-normalized (digits-only phone, lower-case
+// email, collapsed name) by the caller.
+type IdentityFragment struct {
+	ReferenceNumber string
+	PhoneDigits     string
+	Email           string
+	FullNameNorm    string
+}
+
+// MatchEvidence is one deterministic reason or conflict recorded for a
+// candidate. It never carries raw PII; Evidence describes the matched field
+// and whether the comparison was exact, not the values themselves.
+type MatchEvidence struct {
+	Field      string `json:"field"`
+	Reason     string `json:"reason"`
+	Confidence string `json:"confidence"`
+	Detail     string `json:"detail,omitempty"`
+}
+
+// MatchCandidate is one canonical request considered during normalization.
+type MatchCandidate struct {
+	CanonicalRequestID string          `json:"canonicalRequestId"`
+	Rank               int             `json:"rank"`
+	Selected           bool            `json:"selected"`
+	Confidence         string          `json:"confidence"`
+	Score              int             `json:"score"`
+	Reasons            []MatchEvidence `json:"reasons"`
+	Conflicts          []MatchEvidence `json:"conflicts"`
+}
+
+// CallbackRecord is the persisted projection of a hotline callback event.
+type CallbackRecord struct {
+	EventID            string          `json:"eventId"`
+	CanonicalRequestID string          `json:"canonicalRequestId"`
+	Channel            string          `json:"channel"`
+	SourceID           string          `json:"sourceId"`
+	SourceIDField      string          `json:"sourceIdField"`
+	CallbackWindow     *int            `json:"callbackWindowMinutes"`
+	WindowUnit         string          `json:"windowUnit"`
+	WindowStatus       string          `json:"windowStatus"`
+	MatchStatus        string          `json:"matchStatus"`
+	Confidence         string          `json:"confidence"`
+	Candidates         []MatchCandidate `json:"candidates"`
+	ContactExposed     bool            `json:"contactExposed"`
+	ConsentPending     bool            `json:"consentPending"`
+	CreatedAt          time.Time       `json:"createdAt"`
+	LinkedAt           *time.Time      `json:"linkedAt,omitempty"`
+}
 
 // Person is the normalized subject carried by visitor/caller/applicant.
 type Person struct {
@@ -141,13 +232,15 @@ type CanonicalSnapshot struct {
 
 // SubmissionResult is returned for every event POST (including idempotent replay).
 type SubmissionResult struct {
-	EventID            string       `json:"eventId"`
-	Status             string       `json:"status"`
-	CanonicalRequestID string       `json:"canonicalRequestId"`
-	IdempotentReplay   bool         `json:"idempotentReplay,omitempty"`
-	Conflict           *Conflict    `json:"conflict,omitempty"`
-	ItemResults        []ItemResult `json:"itemResults"`
+	EventID            string            `json:"eventId"`
+	Status             string            `json:"status"`
+	CanonicalRequestID string            `json:"canonicalRequestId"`
+	IdempotentReplay   bool              `json:"idempotentReplay,omitempty"`
+	Conflict           *Conflict         `json:"conflict,omitempty"`
+	ItemResults        []ItemResult      `json:"itemResults"`
 	Canonical          CanonicalSnapshot `json:"canonical"`
+	Callback           *CallbackRecord   `json:"callback,omitempty"`
+	MatchCandidates    []MatchCandidate  `json:"matchCandidates,omitempty"`
 }
 
 // Conflict describes a same-eventId/different-payload collision.

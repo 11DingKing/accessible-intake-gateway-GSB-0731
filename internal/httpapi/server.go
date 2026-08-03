@@ -31,7 +31,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/intake/events", s.submitEvent)
 	s.mux.HandleFunc("GET /v1/intake/events/{eventId}", s.getEvent)
 	s.mux.HandleFunc("GET /v1/intake/events/{eventId}/attempts", s.getAttempts)
+	s.mux.HandleFunc("GET /v1/intake/events/{eventId}/candidates", s.getCandidates)
+	s.mux.HandleFunc("GET /v1/intake/events/{eventId}/callback", s.getCallback)
 	s.mux.HandleFunc("GET /v1/intake/canonical/{id}", s.getCanonical)
+	s.mux.HandleFunc("GET /v1/intake/canonical/{id}/callbacks", s.getCallbacks)
 	s.mux.HandleFunc("GET /v1/intake/canonical/{id}/audit", s.getAudit)
 	s.mux.HandleFunc("POST /v1/intake/canonical/{id}/replay", s.replay)
 }
@@ -102,6 +105,43 @@ func (s *Server) getAttempts(w http.ResponseWriter, r *http.Request) {
 		atts = []canonical.Attempt{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"eventId": id, "attempts": atts})
+}
+
+func (s *Server) getCandidates(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("eventId")
+	cands, err := s.svc.MatchCandidates(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	if cands == nil {
+		cands = []canonical.MatchCandidate{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"eventId": id, "candidates": cands})
+}
+
+func (s *Server) getCallback(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("eventId")
+	cb, err := s.svc.Callback(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "callback not found for event")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cb)
+}
+
+func (s *Server) getCallbacks(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cbs, err := s.svc.CallbacksByCanonical(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"canonicalRequestId": id, "callbacks": cbs})
 }
 
 func (s *Server) getCanonical(w http.ResponseWriter, r *http.Request) {

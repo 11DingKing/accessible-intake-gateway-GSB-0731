@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS canonical_requests (
   updated_at      TEXT NOT NULL,
   full_name       TEXT NOT NULL DEFAULT '',
   phone           TEXT NOT NULL DEFAULT '',
+  phone_digits    TEXT NOT NULL DEFAULT '',
   email           TEXT NOT NULL DEFAULT '',
   person_ref      TEXT NOT NULL DEFAULT '',
   callback_window_minutes INTEGER,
@@ -131,6 +132,45 @@ CREATE INDEX IF NOT EXISTS idx_events_canonical ON events(canonical_request_id, 
 CREATE INDEX IF NOT EXISTS idx_attempts_event ON event_attempts(event_id, attempt_no);
 CREATE INDEX IF NOT EXISTS idx_consent_canonical ON consent_records(canonical_request_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_accom_canonical ON accommodation_records(canonical_request_id);
+
+-- callback_events records the hotline-specific projection of every HOTLINE
+-- event, including window classification and candidate matching evidence.
+CREATE TABLE IF NOT EXISTS callback_events (
+  event_id            TEXT PRIMARY KEY REFERENCES events(event_id),
+  canonical_request_id TEXT NOT NULL REFERENCES canonical_requests(id),
+  channel             TEXT NOT NULL,
+  source_id           TEXT NOT NULL DEFAULT '',
+  source_id_field     TEXT NOT NULL DEFAULT '',
+  callback_window_minutes INTEGER,
+  window_unit         TEXT NOT NULL DEFAULT 'MINUTES',
+  window_status       TEXT NOT NULL,
+  match_status        TEXT NOT NULL,
+  confidence          TEXT NOT NULL,
+  contact_exposed     INTEGER NOT NULL DEFAULT 0,
+  consent_pending     INTEGER NOT NULL DEFAULT 1,
+  created_at          TEXT NOT NULL,
+  linked_at           TEXT
+);
+
+-- match_candidates records every canonical request considered when
+-- normalizing an event, with deterministic reasons/conflicts and which
+-- candidate was selected. This makes the matching decision replayable.
+CREATE TABLE IF NOT EXISTS match_candidates (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id             TEXT NOT NULL,
+  canonical_request_id TEXT NOT NULL REFERENCES canonical_requests(id),
+  rank                 INTEGER NOT NULL,
+  selected             INTEGER NOT NULL DEFAULT 0,
+  confidence           TEXT NOT NULL,
+  score                INTEGER NOT NULL,
+  reasons_json         TEXT NOT NULL DEFAULT '[]',
+  conflicts_json       TEXT NOT NULL DEFAULT '[]',
+  created_at           TEXT NOT NULL,
+  UNIQUE(event_id, canonical_request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_callbacks_canonical ON callback_events(canonical_request_id);
+CREATE INDEX IF NOT EXISTS idx_candidates_event ON match_candidates(event_id, rank);
 `
 
 func (s *Store) migrate() error {
@@ -141,6 +181,7 @@ func (s *Store) migrate() error {
 	// introduced. Ignore "duplicate column" errors.
 	alterations := []string{
 		`ALTER TABLE canonical_requests ADD COLUMN person_ref TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE canonical_requests ADD COLUMN phone_digits TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, a := range alterations {
 		if _, err := s.db.Exec(a); err != nil {

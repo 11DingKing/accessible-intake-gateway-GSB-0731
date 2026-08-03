@@ -15,6 +15,16 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // Tx is a single serializable write transaction.
 type Tx struct {
 	tx *sql.Tx
@@ -136,34 +146,38 @@ type CanonicalRow struct {
 	UpdatedAt      string
 	FullName       string
 	Phone          string
+	PhoneDigits    string
 	Email          string
 	PersonRef      string
 	CallbackWindow *int
 	Sequence       int
 }
 
+const canonicalColumns = `id, subject_key, canonical_version, created_at, updated_at,
+		full_name, phone, phone_digits, email, person_ref, callback_window_minutes, sequence`
+
 // FindCanonicalBySubject looks up a chain by its derived subject key.
 func (t *Tx) FindCanonicalBySubject(ctx context.Context, key string) (*CanonicalRow, error) {
-	row := t.tx.QueryRowContext(ctx, `SELECT id, subject_key, canonical_version, created_at, updated_at,
-		full_name, phone, email, person_ref, callback_window_minutes, sequence
+	row := t.tx.QueryRowContext(ctx, `SELECT `+canonicalColumns+`
 		FROM canonical_requests WHERE subject_key=?`, key)
 	return scanCanonical(row)
 }
 
 // FindCanonicalByIdentity looks up an existing chain whose stored reference
-// number, phone, or email matches any non-empty identifier from the event.
-// This is what allows an applicant seen at the physical window to be linked
-// to a later hotline call or web submission that shares one identifier.
-func (t *Tx) FindCanonicalByIdentity(ctx context.Context, ref, phone, email string) (*CanonicalRow, error) {
+// number, normalized phone, or email matches any non-empty identifier from
+// the event. This is what allows an applicant seen at the physical window to
+// be linked to a later hotline call or web submission that shares one
+// identifier.
+func (t *Tx) FindCanonicalByIdentity(ctx context.Context, ref, phoneDigits, email string) (*CanonicalRow, error) {
 	var conds []string
 	var args []any
 	if ref != "" {
 		conds = append(conds, "person_ref = ?")
 		args = append(args, ref)
 	}
-	if phone != "" {
-		conds = append(conds, "phone = ?")
-		args = append(args, phone)
+	if phoneDigits != "" {
+		conds = append(conds, "phone_digits = ?")
+		args = append(args, phoneDigits)
 	}
 	if email != "" {
 		conds = append(conds, "email = ?")
@@ -172,17 +186,56 @@ func (t *Tx) FindCanonicalByIdentity(ctx context.Context, ref, phone, email stri
 	if len(conds) == 0 {
 		return nil, ErrNotFound
 	}
-	q := `SELECT id, subject_key, canonical_version, created_at, updated_at,
-		full_name, phone, email, person_ref, callback_window_minutes, sequence
-		FROM canonical_requests WHERE ` + strings.Join(conds, " OR ") + ` LIMIT 1`
+	q := `SELECT ` + canonicalColumns + `
+		FROM canonical_requests WHERE ` + strings.Join(conds, " OR ") + `
+		ORDER BY sequence ASC LIMIT 1`
 	row := t.tx.QueryRowContext(ctx, q, args...)
 	return scanCanonical(row)
 }
 
+// FindCandidatesByIdentity returns ALL canonical chains that match any of the
+// provided identifiers, ordered deterministically (oldest chain first). It is
+// used by the candidate matching engine to score every possible target.
+func (t *Tx) FindCandidatesByIdentity(ctx context.Context, ref, phoneDigits, email string) ([]*CanonicalRow, error) {
+	var conds []string
+	var args []any
+	if ref != "" {
+		conds = append(conds, "person_ref = ?")
+		args = append(args, ref)
+	}
+	if phoneDigits != "" {
+		conds = append(conds, "phone_digits = ?")
+		args = append(args, phoneDigits)
+	}
+	if email != "" {
+		conds = append(conds, "email = ?")
+		args = append(args, email)
+	}
+	if len(conds) == 0 {
+		return nil, nil
+	}
+	q := `SELECT ` + canonicalColumns + `
+		FROM canonical_requests WHERE ` + strings.Join(conds, " OR ") + `
+		ORDER BY created_at ASC, id ASC`
+	rows, err := t.tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CanonicalRow
+	for rows.Next() {
+		cr, err := scanCanonicalRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cr)
+	}
+	return out, rows.Err()
+}
+
 // FindCanonicalByID looks up a chain by id (read-only).
 func (s *Store) FindCanonicalByID(ctx context.Context, id string) (*CanonicalRow, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, subject_key, canonical_version, created_at, updated_at,
-		full_name, phone, email, person_ref, callback_window_minutes, sequence
+	row := s.db.QueryRowContext(ctx, `SELECT `+canonicalColumns+`
 		FROM canonical_requests WHERE id=?`, id)
 	return scanCanonical(row)
 }
@@ -191,10 +244,25 @@ func scanCanonical(row *sql.Row) (*CanonicalRow, error) {
 	var c CanonicalRow
 	var cb sql.NullInt64
 	err := row.Scan(&c.ID, &c.SubjectKey, &c.Version, &c.CreatedAt, &c.UpdatedAt,
-		&c.FullName, &c.Phone, &c.Email, &c.PersonRef, &cb, &c.Sequence)
+		&c.FullName, &c.Phone, &c.PhoneDigits, &c.Email, &c.PersonRef, &cb, &c.Sequence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
+	if err != nil {
+		return nil, err
+	}
+	if cb.Valid {
+		v := int(cb.Int64)
+		c.CallbackWindow = &v
+	}
+	return &c, nil
+}
+
+func scanCanonicalRows(rows *sql.Rows) (*CanonicalRow, error) {
+	var c CanonicalRow
+	var cb sql.NullInt64
+	err := rows.Scan(&c.ID, &c.SubjectKey, &c.Version, &c.CreatedAt, &c.UpdatedAt,
+		&c.FullName, &c.Phone, &c.PhoneDigits, &c.Email, &c.PersonRef, &cb, &c.Sequence)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +361,8 @@ func (t *Tx) AddAccommodation(ctx context.Context, canonicalID, eventID string, 
 
 // UpdateCanonicalPerson updates non-empty person fields and the callback
 // window on the canonical header (latest-non-empty-wins), so later events can
-// supplement information from another channel.
+// supplement information from another channel. It also maintains the
+// phone_digits column used for deterministic candidate matching.
 func (t *Tx) UpdateCanonicalPerson(ctx context.Context, canonicalID, name, phone, email, ref string, callback *int) error {
 	if name != "" {
 		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET full_name=? WHERE id=?`, name, canonicalID); err != nil {
@@ -301,12 +370,12 @@ func (t *Tx) UpdateCanonicalPerson(ctx context.Context, canonicalID, name, phone
 		}
 	}
 	if phone != "" {
-		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET phone=? WHERE id=?`, phone, canonicalID); err != nil {
+		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET phone=?, phone_digits=? WHERE id=?`, phone, digitsOnly(phone), canonicalID); err != nil {
 			return err
 		}
 	}
 	if email != "" {
-		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET email=? WHERE id=?`, email, canonicalID); err != nil {
+		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET email=? WHERE id=?`, strings.ToLower(strings.TrimSpace(email)), canonicalID); err != nil {
 			return err
 		}
 	}

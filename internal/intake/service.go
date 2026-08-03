@@ -1,7 +1,8 @@
 // Package intake implements the unified intake service: it normalizes
 // channel-specific envelopes, validates each item independently, enforces
 // idempotency and conflict detection, merges events into a single canonical
-// request chain, and records every attempt for audit and stable replay.
+// request chain using deterministic candidate matching with evidence, and
+// records every attempt for audit and stable replay.
 package intake
 
 import (
@@ -11,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/accessible-intake/gateway/internal/canonical"
 	"github.com/accessible-intake/gateway/internal/contracts"
@@ -19,7 +22,7 @@ import (
 
 // Service is the unified intake service.
 type Service struct {
-	store    *store.Store
+	store     *store.Store
 	contracts *contracts.Contracts
 }
 
@@ -40,37 +43,38 @@ type SubmitError struct {
 
 func (e *SubmitError) Error() string { return e.Message }
 
-// AsSubmitError unwraps a SubmitError.
-func AsSubmitError(err error) (*SubmitError, bool) {
-	var se *SubmitError
-	if errors.As(err, &se) {
-		return se, true
-	}
-	return nil, false
-}
-
 // Submit accepts a channel event envelope and returns the normalized result.
 //
 // Transaction semantics (per item):
 //   - Top-level fatal errors (missing eventId, unknown channel) reject the
 //     whole submission; an attempt is recorded and no event is committed.
 //   - Per-item errors (unknown accommodation code, unknown consent scope,
-//     negative callback window) do NOT abort the event. Valid items are
-//     committed, invalid items appear in ItemResults with a code, and the
-//     event is ACCEPTED.
+//     negative/cross-day callback window) do NOT abort the event. Valid items
+//     are committed, invalid items appear in ItemResults, and the event is
+//     ACCEPTED.
 //   - Same eventId + same payload hash returns the original outcome (an
 //     additional attempt is recorded).
 //   - Same eventId + different payload hash returns 409 Conflict and commits
 //     nothing beyond the attempt.
 //   - A simulated adapter transient failure records an ADAPTER_TRANSIENT
-//     attempt and returns 503 without committing the event; the next retry
-//     is a clean, idempotent first commit.
+//     attempt and returns 503 without committing the event.
+//
+// Candidate matching:
+//   - For non-revocation events the service finds ALL existing canonical
+//     chains sharing any identifier (reference number, normalized phone,
+//     email), scores each deterministically, and auto-links to the highest
+//     scoring candidate when the score is strong enough (>=80). Name-only
+//     matches never auto-link. If no candidate qualifies, a new chain is
+//     created. Every evaluated candidate with its reasons/conflicts is
+//     persisted to match_candidates for replay.
+//   - Two channels concurrently reporting the same applicant serialize on
+//     BEGIN IMMEDIATE; the second transaction finds the chain created by the
+//     first and appends to it, so exactly one canonical event chain exists.
 func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*canonical.SubmissionResult, error) {
 	hash := canonical.StablePayloadHash(env)
 	norm := canonical.Normalize(env)
 	results, fatal := canonical.Validate(norm, s.contracts)
 
-	// Fatal top-level errors: record attempt and reject without committing.
 	if fatal {
 		if err := s.recordAttemptOnly(ctx, norm.EventID, hash, canonical.AttemptValidationError, results); err != nil {
 			return nil, err
@@ -86,9 +90,6 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		}
 	}
 
-	// Simulated adapter transient failure: record a failed attempt and stop
-	// before committing. The event is NOT persisted, so the subsequent retry
-	// commits once and only once.
 	if env.SimulateAdapterTransient {
 		if err := s.recordAttemptOnly(ctx, norm.EventID, hash, canonical.AttemptAdapterTransient, results); err != nil {
 			return nil, err
@@ -110,7 +111,6 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		return nil, err
 	}
 
-	// Idempotency / conflict check.
 	existing, err := tx.FindEvent(ctx, norm.EventID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -124,6 +124,8 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 				return nil, err
 			}
 			snap, _ := s.store.BuildSnapshot(ctx, existing.CanonicalID, store.SnapshotOptions{RedactContacts: true})
+			candidates, _ := s.store.FindMatchCandidates(ctx, norm.EventID)
+			cb, _ := s.store.FindCallback(ctx, norm.EventID)
 			return nil, &SubmitError{
 				Status: 409, Code: "EVENT_CONFLICT",
 				Message: "eventId already exists with a different payload",
@@ -137,18 +139,21 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 						IncomingHash: hash,
 						Message:      "same eventId with different payload is a conflict",
 					},
-					ItemResults: results,
-					Canonical:   snap,
+					ItemResults:     results,
+					Canonical:       snap,
+					MatchCandidates: candidates,
+					Callback:        s.callbackToAPI(ctx, cb),
 				},
 			}
 		}
-		// Same hash: idempotent replay. Record attempt and return original.
 		_ = tx.RecordAttempt(ctx, norm.EventID, attemptNo, hash, canonical.AttemptOK, results)
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
 		itemResults, _ := s.store.EventItemResults(ctx, norm.EventID)
 		snap, _ := s.store.BuildSnapshot(ctx, existing.CanonicalID, store.SnapshotOptions{RedactContacts: true})
+		candidates, _ := s.store.FindMatchCandidates(ctx, norm.EventID)
+		cb, _ := s.store.FindCallback(ctx, norm.EventID)
 		return &canonical.SubmissionResult{
 			EventID:            norm.EventID,
 			Status:             existing.Status,
@@ -156,11 +161,15 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 			IdempotentReplay:   true,
 			ItemResults:        itemResults,
 			Canonical:          snap,
+			MatchCandidates:    candidates,
+			Callback:           s.callbackToAPI(ctx, cb),
 		}, nil
 	}
 
-	// Determine canonical chain.
 	var canonicalID string
+	var scored []canonical.ScoredCandidate
+	var matchStatus string
+
 	if norm.IsRevocation() {
 		canonicalID, err = tx.CanonicalIDForEvent(ctx, norm.Revokes)
 		if err != nil {
@@ -186,7 +195,9 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 			}
 			return nil, err
 		}
+		matchStatus = canonical.MatchLinked
 	} else {
+		identity := norm.IdentityOf()
 		subjectKey := norm.SubjectKey()
 		if subjectKey == "" {
 			results = append(results, canonical.ItemResult{
@@ -208,21 +219,44 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 			}
 		}
 
-		// Link to an existing chain if ANY stored identifier matches. This
-		// is what unifies an in-person visit, hotline call, and web
-		// submission from the same applicant into one event chain.
-		cr, err := tx.FindCanonicalByIdentity(ctx,
-			norm.Person.ReferenceNumber, norm.Person.Phone, norm.Person.Email)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
+		candidates, err := tx.FindCandidatesByIdentity(ctx, identity.ReferenceNumber, identity.PhoneDigits, identity.Email)
+		if err != nil {
 			return nil, err
 		}
-		if cr != nil {
-			canonicalID = cr.ID
+		for _, cr := range candidates {
+			existingFrag := canonical.IdentityFragment{
+				ReferenceNumber: cr.PersonRef,
+				PhoneDigits:     cr.PhoneDigits,
+				Email:           cr.Email,
+				FullNameNorm:    normalizeName(cr.FullName),
+			}
+			sc := canonical.ScoreCandidate(identity, existingFrag)
+			sc.CanonicalID = cr.ID
+			scored = append(scored, sc)
+		}
+		canonical.RankCandidates(scored)
+
+		selected := (*canonical.ScoredCandidate)(nil)
+		for i := range scored {
+			if scored[i].CanAutoLink() {
+				selected = &scored[i]
+				break
+			}
+		}
+
+		if selected != nil {
+			canonicalID = selected.CanonicalID
+			if selected.HasConflict() {
+				matchStatus = canonical.MatchConflict
+			} else {
+				matchStatus = canonical.MatchLinked
+			}
 		} else {
 			canonicalID = newCanonicalID()
 			if err := tx.CreateCanonical(ctx, canonicalID, subjectKey, s.contracts.Version()); err != nil {
 				return nil, err
 			}
+			matchStatus = canonical.MatchPending
 		}
 	}
 
@@ -231,14 +265,24 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		return nil, err
 	}
 
-	// Record the attempt (OK) and capture its id for validation error linkage.
 	attemptID, err := tx.RecordAttemptWithID(ctx, norm.EventID, attemptNo, hash, canonical.AttemptOK, results)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build and persist the event row. Valid items only are stored; invalid
-	// items are recorded as validation errors.
+	selectedID := canonicalID
+	matchCandidates := canonical.ToMatchCandidates(scored, selectedID)
+	for i := range matchCandidates {
+		if err := tx.InsertMatchCandidate(ctx, norm.EventID, matchCandidates[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	contactGrantedBefore, err := tx.HasConsentScope(ctx, canonicalID, "CONTACT_CALLBACK")
+	if err != nil {
+		return nil, err
+	}
+
 	eventRow := store.EventRow{
 		EventID:         norm.EventID,
 		CanonicalID:     canonicalID,
@@ -251,6 +295,12 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		ItemResultsJSON: mustJSON(results),
 	}
 
+	var windowStatus string
+	var effectiveWindow *int
+	if norm.Channel == canonical.ChannelHotline {
+		windowStatus, effectiveWindow, _ = canonical.ClassifyCallbackWindow(norm.CallbackWindow)
+	}
+
 	if norm.IsRevocation() {
 		eventRow.IsRevocation = true
 		eventRow.Revokes = norm.Revokes
@@ -259,7 +309,7 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		eventRow.PersonPhone = norm.Person.Phone
 		eventRow.PersonEmail = norm.Person.Email
 		eventRow.PersonRef = norm.Person.ReferenceNumber
-		eventRow.CallbackWindow = validCallback(norm)
+		eventRow.CallbackWindow = effectiveWindow
 	}
 
 	eventRow.PayloadJSON = mustJSON(env)
@@ -268,8 +318,6 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		return nil, err
 	}
 
-	// Apply valid items. Invalid items are already captured in results and
-	// will be persisted as validation_errors below.
 	if norm.IsRevocation() {
 		for _, scope := range norm.RevocationScopes {
 			if s.contracts.IsConsentScope(scope) {
@@ -295,7 +343,42 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		}
 		if err := tx.UpdateCanonicalPerson(ctx, canonicalID,
 			norm.Person.FullName, norm.Person.Phone, norm.Person.Email,
-			norm.Person.ReferenceNumber, validCallback(norm)); err != nil {
+			norm.Person.ReferenceNumber, effectiveWindow); err != nil {
+			return nil, err
+		}
+	}
+
+	if norm.Channel == canonical.ChannelHotline {
+		contactGrantedAfter, err := tx.HasConsentScope(ctx, canonicalID, "CONTACT_CALLBACK")
+		if err != nil {
+			return nil, err
+		}
+		contactExposed := contactGrantedAfter
+		confidence := canonical.ConfidenceNone
+		if selected := findSelected(scored, selectedID); selected != nil {
+			confidence = selected.Confidence
+		}
+		cb := canonical.CallbackRecord{
+			EventID:            norm.EventID,
+			CanonicalRequestID: canonicalID,
+			Channel:            norm.Channel,
+			SourceID:           norm.SourceID,
+			SourceIDField:      s.contracts.Channels[norm.Channel].SourceIDField,
+			CallbackWindow:     effectiveWindow,
+			WindowUnit:         canonical.CallbackWindowUnit,
+			WindowStatus:       windowStatus,
+			MatchStatus:        matchStatus,
+			Confidence:         confidence,
+			Candidates:         matchCandidates,
+			ContactExposed:     contactExposed,
+			ConsentPending:     !contactGrantedBefore && !contactGrantedAfter,
+			CreatedAt:          time.Now().UTC(),
+		}
+		if matchStatus == canonical.MatchLinked || matchStatus == canonical.MatchConflict {
+			now := time.Now().UTC()
+			cb.LinkedAt = &now
+		}
+		if err := tx.InsertCallback(ctx, cb); err != nil {
 			return nil, err
 		}
 	}
@@ -313,17 +396,60 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		return nil, err
 	}
 
-	return &canonical.SubmissionResult{
+	result := &canonical.SubmissionResult{
 		EventID:            norm.EventID,
 		Status:             canonical.EventAccepted,
 		CanonicalRequestID: canonicalID,
 		ItemResults:        results,
 		Canonical:          snap,
-	}, nil
+		MatchCandidates:    matchCandidates,
+	}
+	if norm.Channel == canonical.ChannelHotline {
+		cb, _ := s.store.FindCallback(ctx, norm.EventID)
+		result.Callback = s.callbackToAPI(ctx, cb)
+	}
+	return result, nil
 }
 
-// recordAttemptOnly persists a single attempt outside of the main write
-// transaction (used for fatal validation and simulated adapter failures).
+func findSelected(scored []canonical.ScoredCandidate, id string) *canonical.ScoredCandidate {
+	for i := range scored {
+		if scored[i].CanonicalID == id && scored[i].CanAutoLink() {
+			return &scored[i]
+		}
+	}
+	return nil
+}
+
+func (s *Service) callbackToAPI(ctx context.Context, row *store.CallbackRow) *canonical.CallbackRecord {
+	if row == nil {
+		return nil
+	}
+	contactGranted, _ := s.store.HasConsentScope(ctx, row.CanonicalRequestID, "CONTACT_CALLBACK")
+	created, _ := time.Parse(time.RFC3339Nano, row.CreatedAt)
+	cb := &canonical.CallbackRecord{
+		EventID:            row.EventID,
+		CanonicalRequestID: row.CanonicalRequestID,
+		Channel:            row.Channel,
+		SourceID:           row.SourceID,
+		SourceIDField:      row.SourceIDField,
+		CallbackWindow:     row.CallbackWindow,
+		WindowUnit:         row.WindowUnit,
+		WindowStatus:       row.WindowStatus,
+		MatchStatus:        row.MatchStatus,
+		Confidence:         row.Confidence,
+		ContactExposed:     contactGranted,
+		ConsentPending:     row.ConsentPending || !contactGranted,
+		CreatedAt:          created,
+	}
+	if row.LinkedAt.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, row.LinkedAt.String)
+		cb.LinkedAt = &t
+	}
+	cands, _ := s.store.FindMatchCandidates(ctx, row.EventID)
+	cb.Candidates = cands
+	return cb
+}
+
 func (s *Service) recordAttemptOnly(ctx context.Context, eventID, hash, status string, results []canonical.ItemResult) error {
 	tx, err := s.store.Begin(ctx)
 	if err != nil {
@@ -350,8 +476,7 @@ func (s *Service) Audit(ctx context.Context, id string) (canonical.AuditSummary,
 	return s.store.AuditSummary(ctx, id)
 }
 
-// Replay reconstructs the canonical snapshot and asserts it matches the stored
-// state. It returns the reconstructed snapshot and the list of events applied.
+// Replay reconstructs the canonical snapshot from the event log.
 func (s *Service) Replay(ctx context.Context, id string) (canonical.CanonicalSnapshot, []canonical.EventAudit, error) {
 	snap, err := s.store.BuildSnapshot(ctx, id, store.SnapshotOptions{RedactContacts: true})
 	if err != nil {
@@ -382,12 +507,35 @@ func (s *Service) Attempts(ctx context.Context, eventID string) ([]canonical.Att
 	return s.store.Attempts(ctx, eventID)
 }
 
-func validCallback(n canonical.NormalizedEvent) *int {
-	if n.CallbackWindow == nil || *n.CallbackWindow < 0 {
-		return nil
+// Callback returns the callback projection for an event.
+func (s *Service) Callback(ctx context.Context, eventID string) (*canonical.CallbackRecord, error) {
+	row, err := s.store.FindCallback(ctx, eventID)
+	if err != nil {
+		return nil, err
 	}
-	v := *n.CallbackWindow
-	return &v
+	return s.callbackToAPI(ctx, row), nil
+}
+
+// CallbacksByCanonical returns all callbacks for a canonical chain.
+func (s *Service) CallbacksByCanonical(ctx context.Context, canonicalID string) ([]*canonical.CallbackRecord, error) {
+	rows, err := s.store.FindCallbacksByCanonical(ctx, canonicalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*canonical.CallbackRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, s.callbackToAPI(ctx, r))
+	}
+	return out, nil
+}
+
+// MatchCandidates returns the evaluated candidates for an event.
+func (s *Service) MatchCandidates(ctx context.Context, eventID string) ([]canonical.MatchCandidate, error) {
+	return s.store.FindMatchCandidates(ctx, eventID)
+}
+
+func normalizeName(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
 }
 
 func joinMessages(results []canonical.ItemResult) string {

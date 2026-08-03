@@ -73,6 +73,8 @@ Tables:
 | `consent_records` | Append-only GRANT/REVOKE entries per scope; the latest entry wins. |
 | `accommodation_records` | Valid accommodation codes requested on the chain (deduped). |
 | `validation_errors` | Per-item error rows tied to an event and attempt. |
+| `callback_events` | Hotline callback projection: window classification, match status, confidence, contact-exposure decision. |
+| `match_candidates` | Every canonical chain evaluated during normalization, with rank, selected flag, score, reasons, and conflicts. |
 | `schema_migrations` | Applied migration versions. |
 
 ## API
@@ -140,7 +142,10 @@ Other endpoints:
 | `GET /healthz` | Liveness probe. |
 | `GET /v1/intake/events/{eventId}` | Committed event and its per-item results. |
 | `GET /v1/intake/events/{eventId}/attempts` | Every attempt for an event (oldest first). |
+| `GET /v1/intake/events/{eventId}/candidates` | Deterministic match candidates with reasons/conflicts/confidence. |
+| `GET /v1/intake/events/{eventId}/callback` | Hotline callback projection (window classification, match status, contact exposure). |
 | `GET /v1/intake/canonical/{id}` | Current masked canonical snapshot. |
+| `GET /v1/intake/canonical/{id}/callbacks` | All callback events for a chain. |
 | `GET /v1/intake/canonical/{id}/audit` | Minimal replayable audit summary. |
 | `POST /v1/intake/canonical/{id}/replay` | Reconstructs the snapshot from the event log and returns it with the events applied. |
 
@@ -212,6 +217,73 @@ the first and appends to it. The result is exactly one canonical request with
 contiguous sequence numbers, never two duplicated chains. Two concurrent
 submissions of the *same* `eventId` likewise commit exactly one event row; the
 other receives the idempotent replay.
+
+## Hotline callback events and candidate matching
+
+Hotline callbacks (`channel: "HOTLINE"` with `callbackWindowMinutes`) may arrive
+before the web intake creates a record, and may carry identity fragments that
+partially match and partially conflict with an existing chain. The gateway
+handles this with deterministic candidate matching.
+
+### Early arrival (out-of-order)
+
+When a callback arrives and no existing chain shares a strong identifier, the
+service creates a new provisional canonical chain and records the callback with
+`matchStatus: "PENDING"`. When a later web (or physical) event arrives with a
+matching identifier, it finds that chain via candidate scoring and appends to it.
+The result is exactly one canonical event chain regardless of arrival order.
+
+### Deterministic candidate scoring
+
+For every non-revocation event the service queries all existing canonical
+chains that share any identifier (`referenceNumber`, digit-normalized phone, or
+lower-cased email) and scores each against the incoming identity:
+
+| Signal | Weight | Confidence |
+|---|---|---|
+| reference number exact | 100 | HIGH |
+| phone digits exact | 80 | HIGH |
+| email case-insensitive exact | 80 | HIGH |
+| normalized name exact | 10 | LOW (never auto-links alone) |
+
+Candidates are ranked by score (desc), then confidence, then fewest conflicts,
+then lexicographic id (tiebreaker). The first candidate with score ≥ 80 is
+auto-linked. Name-only matches (score 10) never auto-link because names are not
+unique. When a strong identifier matches but another present identifier differs
+(e.g. same phone, different email), the event is still linked to one chain with
+`matchStatus: "CONFLICT"`, confidence `MEDIUM`, and the differing field is
+recorded as `IDENTITY_FRAGMENT_CONFLICT` evidence. Every evaluated candidate is
+persisted to `match_candidates` with its rank, reasons, and conflicts, so the
+matching decision is fully replayable.
+
+### `callbackWindowMinutes` classification
+
+The field continues to use the minute unit established in round 1
+(`windowUnit: "MINUTES"`). Values are classified per event:
+
+| Value | `windowStatus` | Per-item result | Effect |
+|---|---|---|---|
+| `0` | `ZERO` | none (valid) | Stored as 0; means "as soon as possible" |
+| positive 1–1439 | `OK` | none | Stored as the effective window |
+| negative | `NEGATIVE_REJECTED` | `INVALID_VALUE` | Not stored; event accepted with other valid items |
+| ≥ 1440 (24h) | `CROSS_DAY_REJECTED` | `CROSS_DAY_WINDOW` | Not stored; cross-day windows not accepted |
+| absent | `ABSENT` | none | No window constraint |
+
+### Duplicate and conflicting callback keys
+
+- **Same `eventId` + same payload**: idempotent replay; the original callback
+  projection and match evidence are returned with `idempotentReplay: true`.
+- **Same `eventId` + different payload**: HTTP `409 Conflict` with both hashes;
+  no second event or chain is created.
+
+### Contact exposure before consent
+
+A callback's phone/email are never exposed in any response until
+`CONTACT_CALLBACK` is granted on the chain: the callback record returns
+`contactExposed: false`, `consentPending: true`, and the canonical snapshot
+returns `contactMasked: true`. Contact exposure is recomputed at read time from
+current consent state, so a later withdrawal cannot be bypassed by replaying an
+earlier response.
 
 ## Audit and stable replay
 
