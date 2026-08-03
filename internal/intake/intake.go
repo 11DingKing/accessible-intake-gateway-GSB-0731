@@ -431,10 +431,19 @@ func projectionOrder(events []*AppliedEvent) []*AppliedEvent {
 
 // Project deterministically builds the canonical view from an ordered event
 // chain. It is pure and therefore stably replayable.
+//
+// Consent scopes are treated as tombstones: every granted scope is collected,
+// every revoked scope is collected, and the effective set is
+// granted - revoked. A scope that was once revoked can therefore never be
+// resurrected by a later (or retried) event that re-grants it, while scopes
+// that were never revoked remain intact. This is what keeps a late hotline
+// retry from re-exposing a phone number whose CONTACT_CALLBACK consent was
+// already withdrawn.
 func Project(requestID string, events []*AppliedEvent) *CanonicalView {
 	ordered := projectionOrder(events)
 
 	granted := map[string]bool{}
+	revoked := map[string]bool{}
 	accs := map[string]bool{}
 	sourceRefs := map[string]string{}
 	var person Person
@@ -462,25 +471,29 @@ func Project(requestID string, events []*AppliedEvent) *CanonicalView {
 		for _, s := range e.Consent {
 			granted[s] = true
 		}
-		if e.CallbackWindowMinutes != nil {
-			cb := *e.CallbackWindowMinutes
-			callback = &cb
-		}
-		if e.Summary != "" {
-			summary = e.Summary
-		}
 		for _, s := range e.RevocationScopes {
+			revoked[s] = true
 			delete(granted, s)
 		}
 	}
 
-	contactOK := granted["CONTACT_CALLBACK"]
+	// Tombstone rule: a revoked scope is permanently withdrawn, even if another
+	// event in the chain (including a late retried delivery) also grants it.
+	effective := map[string]bool{}
+	for s := range granted {
+		if !revoked[s] {
+			effective[s] = true
+		}
+	}
+
+	contactOK := effective["CONTACT_CALLBACK"]
+	accTransfer := effective["ACCOMMODATION_TRANSFER"]
+	summaryTransfer := effective["CASE_SUMMARY_TRANSFER"]
+
 	viewPerson := person
 	if !contactOK {
 		viewPerson.Phone = ""
 		viewPerson.Email = ""
-	}
-	if !contactOK && callback != nil {
 		callback = nil
 	}
 
@@ -489,18 +502,16 @@ func Project(requestID string, events []*AppliedEvent) *CanonicalView {
 		accList = append(accList, a)
 	}
 	sort.Strings(accList)
+	if !accTransfer {
+		accList = []string{}
+	}
 
-	consentList := make([]string, 0, len(granted))
-	for s := range granted {
+	consentList := make([]string, 0, len(effective))
+	for s := range effective {
 		consentList = append(consentList, s)
 	}
 	sort.Strings(consentList)
 
-	if !granted["ACCOMMODATION_TRANSFER"] {
-		accList = []string{}
-	}
-	summaryTransfer := granted["CASE_SUMMARY_TRANSFER"]
-	accTransfer := granted["ACCOMMODATION_TRANSFER"]
 	if !summaryTransfer {
 		summary = ""
 	}

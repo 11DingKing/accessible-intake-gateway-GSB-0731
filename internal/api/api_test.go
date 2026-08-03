@@ -631,3 +631,283 @@ func TestAdapterFailureRecoveryKeepsSingleChain(t *testing.T) {
 		t.Fatalf("retried projection must contain both events, got %v", chain)
 	}
 }
+
+func TestEVW002RevocationRedactsContactAndLateHotlineRetryCannotResurrect(t *testing.T) {
+	h := newHarness(t)
+	h.adapter.FailOnce()
+
+	person := map[string]any{"firstName": "Revo", "lastName": "Cation", "dateOfBirth": "1972-03-04", "phone": "555-4321"}
+	// Initial web record that grants CONTACT_CALLBACK.
+	r1, o1 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-W-001", "channel": "WEB", "submissionId": "W-001",
+		"applicant": person, "consent": []string{"CONTACT_CALLBACK", "ACCOMMODATION_TRANSFER"},
+		"accommodations": []string{"TEXT_ONLY"},
+	})
+	if r1.StatusCode != 202 {
+		t.Fatalf("expected 202 (adapter transient failure), got %d", r1.StatusCode)
+	}
+	rid := asMap(t, o1["result"])["canonicalRequestId"].(string)
+
+	// EV-W-002 revokes CONTACT_CALLBACK (fixture shape).
+	r2, o2 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-W-002", "channel": "WEB", "submissionId": "W-002",
+		"applicant": person, "revokes": "EV-W-001", "scopes": []string{"CONTACT_CALLBACK"},
+	})
+	if r2.StatusCode != 200 {
+		t.Fatalf("revocation: %d %v", r2.StatusCode, o2)
+	}
+	view2 := asMap(t, o2["canonical"])
+	if view2["contactAvailable"] != false {
+		t.Fatalf("contact must be unavailable after EV-W-002")
+	}
+	p2 := asMap(t, view2["person"])
+	if phone, _ := p2["phone"].(string); phone != "" {
+		t.Fatalf("phone must be redacted after revocation: %v", p2)
+	}
+	// Un-revoked ACCOMMODATION_TRANSFER must remain intact.
+	if view2["accommodationTransferable"] != true {
+		t.Fatalf("un-revoked accommodation transfer must remain: %v", view2)
+	}
+	accs, _ := view2["accommodations"].([]any)
+	if len(accs) != 1 || accs[0] != "TEXT_ONLY" {
+		t.Fatalf("accommodation must not be over-cleared: %v", accs)
+	}
+
+	// A late hotline callback retries the still-pending web delivery and carries
+	// the already-withdrawn phone. It must not resurrect contact.
+	_, o3 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-LATE", "channel": "HOTLINE", "callRef": "C-LATE",
+		"caller":                person,
+		"callbackWindowMinutes": 30,
+		"consent":               []string{"CONTACT_CALLBACK"},
+	})
+	if asMap(t, o3["result"])["canonicalRequestId"].(string) != rid {
+		t.Fatalf("late hotline event must stay on the same chain")
+	}
+	// Now retry the original web delivery; projection is recomputed and must
+	// reflect the revocation even though the retry re-grants via the hotline.
+	r4, o4 := h.post(t, "/api/v1/events/EV-W-001/retry", map[string]any{})
+	if r4.StatusCode != 200 {
+		t.Fatalf("retry: %d %v", r4.StatusCode, o4)
+	}
+	v4 := asMap(t, o4["canonical"])
+	if v4["contactAvailable"] != false {
+		t.Fatalf("retry must not resurrect withdrawn contact: %v", v4)
+	}
+	p4 := asMap(t, v4["person"])
+	if phone, _ := p4["phone"].(string); phone != "" {
+		t.Fatalf("retry must not re-expose withdrawn phone: %v", p4)
+	}
+	if v4["callbackWindowMinutes"] != nil {
+		t.Fatalf("callback window must be hidden after CONTACT_CALLBACK revocation")
+	}
+	// Every delivered view sent to the adapter must have contact redacted.
+	for _, d := range h.adapter.Deliveries(rid) {
+		if d.ContactAvailable {
+			t.Fatalf("adapter received a view with contact available after revocation")
+		}
+		if d.Person.Phone != "" {
+			t.Fatalf("adapter received a view containing the withdrawn phone: %q", d.Person.Phone)
+		}
+	}
+}
+
+func TestDuplicateRevocationIsIdempotent(t *testing.T) {
+	h := newHarness(t)
+	person := map[string]any{"firstName": "D", "lastName": "D", "dateOfBirth": "1981-01-01", "phone": "555-0001"}
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-DR-1", "channel": "WEB", "submissionId": "W-DR-1",
+		"applicant": person, "consent": []string{"CONTACT_CALLBACK", "CASE_SUMMARY_TRANSFER"}, "summary": "s",
+	})
+	rev := map[string]any{
+		"eventId": "EV-DR-2", "channel": "WEB", "submissionId": "W-DR-2",
+		"applicant": person, "revokes": "EV-DR-1", "scopes": []string{"CASE_SUMMARY_TRANSFER"},
+	}
+	_, first := h.post(t, "/api/v1/events", rev)
+	_, again := h.post(t, "/api/v1/events", rev)
+	fv := asMap(t, first["canonical"])
+	av := asMap(t, again["canonical"])
+	if fv["projectionHash"] != av["projectionHash"] {
+		t.Fatalf("duplicate revocation must produce identical projection")
+	}
+	if fv["summaryTransferable"] != false {
+		t.Fatalf("summary should be revoked")
+	}
+	// Repeating the same revocation scope via another event must remain a no-op
+	// for effective consent (tombstone).
+	_, r3 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-DR-3", "channel": "WEB", "submissionId": "W-DR-3",
+		"applicant": person, "revokes": "EV-DR-1", "scopes": []string{"CASE_SUMMARY_TRANSFER"},
+	})
+	v3 := asMap(t, r3["canonical"])
+	if v3["summaryTransferable"] != false {
+		t.Fatalf("repeated revocation scope must not re-enable transfer")
+	}
+}
+
+func TestOutOfOrderRevocationFailureAndSupplementDoNotOverClear(t *testing.T) {
+	h := newHarness(t)
+	h.adapter.FailOnce()
+	person := map[string]any{"firstName": "Out", "lastName": "Order", "dateOfBirth": "1969-09-09", "phone": "555-7777", "email": "out@example.com"}
+
+	// 1) The original web event (whose delivery will fail) arrives first and
+	//    is left pending.
+	r1, o1 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-OO-1", "channel": "WEB", "submissionId": "W-OO-1",
+		"applicant": person, "consent": []string{"CONTACT_CALLBACK", "ACCOMMODATION_TRANSFER"},
+	})
+	if r1.StatusCode != 202 {
+		t.Fatalf("expected 202 on adapter failure, got %d", r1.StatusCode)
+	}
+	rid := asMap(t, o1["result"])["canonicalRequestId"].(string)
+	// 2) Revocation arrives next (out of order relative to the retry).
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-OO-2", "channel": "WEB", "submissionId": "W-OO-2",
+		"applicant": person, "revokes": "EV-OO-1", "scopes": []string{"CONTACT_CALLBACK"},
+		"canonicalRequestId": rid,
+	})
+	// 3) A physical-channel supplement adds accommodation consent (not revoked).
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-OO-3", "channel": "PHYSICAL", "deskReceiptNo": "D-OO",
+		"visitor": person, "accommodations": []string{"SIGN_INTERPRETER"},
+		"canonicalRequestId": rid,
+	})
+	// Now retry the original web delivery after all events are in.
+	r2, o2 := h.post(t, "/api/v1/events/EV-OO-1/retry", map[string]any{})
+	if r2.StatusCode != 200 {
+		t.Fatalf("retry: %d", r2.StatusCode)
+	}
+	v := asMap(t, o2["canonical"])
+	if v["contactAvailable"] != false {
+		t.Fatalf("out-of-order revocation must keep contact withdrawn")
+	}
+	p := asMap(t, v["person"])
+	if phone, _ := p["phone"].(string); phone != "" {
+		t.Fatalf("phone must stay redacted: %v", p)
+	}
+	// Un-revoked ACCOMMODATION_TRANSFER must still expose the accommodation.
+	if v["accommodationTransferable"] != true {
+		t.Fatalf("accommodation transfer must not be over-cleared")
+	}
+	accs, _ := v["accommodations"].([]any)
+	if len(accs) != 1 || accs[0] != "SIGN_INTERPRETER" {
+		t.Fatalf("physical-channel accommodation must survive: %v", accs)
+	}
+	// All three events must be on the single chain.
+	chain, _ := v["eventChain"].([]any)
+	if len(chain) != 3 {
+		t.Fatalf("expected 3-event cross-channel chain, got %v", chain)
+	}
+	// Stable replay.
+	_, replay := h.get(t, "/api/v1/requests/"+rid)
+	if replay["projectionHash"] != v["projectionHash"] {
+		t.Fatalf("replay changed the projection")
+	}
+}
+
+func TestCrossEventChainAndConcurrentRevocationTransactions(t *testing.T) {
+	h := newHarness(t)
+	person := map[string]any{"firstName": "Cross", "lastName": "Chain", "dateOfBirth": "1958-05-05", "phone": "555-8888"}
+
+	// Build events across all three channels first.
+	_, o1 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-CX-P", "channel": "PHYSICAL", "deskReceiptNo": "D-CX",
+		"visitor": person, "accommodations": []string{"BRAILLE_MATERIAL"},
+		"consent": []string{"ACCOMMODATION_TRANSFER", "CONTACT_CALLBACK"},
+	})
+	rid := asMap(t, o1["result"])["canonicalRequestId"].(string)
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-CX-H", "channel": "HOTLINE", "callRef": "C-CX",
+		"caller": person, "callbackWindowMinutes": 20, "consent": []string{"CONTACT_CALLBACK"},
+		"canonicalRequestId": rid,
+	})
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-CX-W", "channel": "WEB", "submissionId": "W-CX",
+		"applicant": person, "consent": []string{"CASE_SUMMARY_TRANSFER"}, "summary": "case",
+		"canonicalRequestId": rid,
+	})
+
+	// The audit chain must list all three channel events.
+	_, audit := h.get(t, "/api/v1/requests/"+rid+"/audit")
+	chain, _ := audit["chain"].([]any)
+	if len(chain) != 3 {
+		t.Fatalf("audit chain must span 3 events, got %v", chain)
+	}
+
+	// Concurrent revocation + supplement transactions must leave exactly one
+	// chain and a stable (last-writer-does-not-resurrect) projection.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		h.post(t, "/api/v1/events", map[string]any{
+			"eventId": "EV-CX-REV", "channel": "WEB", "submissionId": "W-CX-REV",
+			"applicant": person, "revokes": "EV-CX-P", "scopes": []string{"CONTACT_CALLBACK"},
+			"canonicalRequestId": rid,
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		h.post(t, "/api/v1/events", map[string]any{
+			"eventId": "EV-CX-SUP", "channel": "HOTLINE", "callRef": "C-CX-S",
+			"caller": person, "callbackWindowMinutes": 10, "consent": []string{"CONTACT_CALLBACK"},
+			"canonicalRequestId": rid,
+		})
+	}()
+	wg.Wait()
+
+	_, v := h.get(t, "/api/v1/requests/"+rid)
+	if v["contactAvailable"] != false {
+		t.Fatalf("concurrent revocation must win and contact must stay withdrawn")
+	}
+	p := asMap(t, v["person"])
+	if phone, _ := p["phone"].(string); phone != "" {
+		t.Fatalf("withdrawn phone must not appear after concurrent txns: %v", p)
+	}
+	// Accommodation scope was never revoked; must remain.
+	if v["accommodationTransferable"] != true {
+		t.Fatalf("un-revoked scope must survive concurrent txns")
+	}
+	chain2, _ := v["eventChain"].([]any)
+	if len(chain2) != 5 {
+		t.Fatalf("expected 5 events in the single chain, got %d", len(chain2))
+	}
+}
+
+func TestReplayAfterRevocationIsStableAndDoesNotResurrect(t *testing.T) {
+	h := newHarness(t)
+	person := map[string]any{"firstName": "Stable", "lastName": "Replay", "dateOfBirth": "1947-07-07", "phone": "555-1212"}
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-ST-1", "channel": "WEB", "submissionId": "W-ST-1",
+		"applicant": person, "consent": []string{"CONTACT_CALLBACK", "CASE_SUMMARY_TRANSFER"}, "summary": "x",
+	})
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-ST-2", "channel": "WEB", "submissionId": "W-ST-2",
+		"applicant": person, "revokes": "EV-ST-1", "scopes": []string{"CONTACT_CALLBACK"},
+	})
+	// A later event that re-grants CONTACT_CALLBACK must not undo the revocation.
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-ST-3", "channel": "HOTLINE", "callRef": "C-ST",
+		"caller": person, "consent": []string{"CONTACT_CALLBACK"}, "callbackWindowMinutes": 15,
+	})
+	rid := ""
+	for _, ev := range []string{"EV-ST-1", "EV-ST-2", "EV-ST-3"} {
+		_, r := h.get(t, "/api/v1/events/"+ev)
+		rid = asMap(t, r)["canonicalRequestId"].(string)
+	}
+	hashes := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		_, v := h.get(t, "/api/v1/requests/"+rid)
+		if v["contactAvailable"] != false {
+			t.Fatalf("replay must keep contact revoked")
+		}
+		p := asMap(t, v["person"])
+		if phone, _ := p["phone"].(string); phone != "" {
+			t.Fatalf("phone must never reappear: %v", p)
+		}
+		hashes[v["projectionHash"].(string)] = true
+	}
+	if len(hashes) != 1 {
+		t.Fatalf("replay produced multiple projection hashes: %v", hashes)
+	}
+}

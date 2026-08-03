@@ -50,3 +50,48 @@ func TestOutOfOrderRevocationIsPlacedAfterGrant(t *testing.T) {
 		t.Fatalf("revocation after grant must remove contact")
 	}
 }
+
+func TestRevocationTombstonePreventsLateRegrant(t *testing.T) {
+	grant := &AppliedEvent{EventID: "G", Channel: "WEB", SourceID: "W", Consent: []string{"CONTACT_CALLBACK", "ACCOMMODATION_TRANSFER"}, Person: Person{FirstName: "T", LastName: "Stone", DateOfBirth: "1970-01-01", Phone: "999"}, Accommodations: []string{"TEXT_ONLY"}}
+	rev := &AppliedEvent{EventID: "R", RevokesEventID: "G", RevocationScopes: []string{"CONTACT_CALLBACK"}}
+	// A late hotline retry re-grants CONTACT_CALLBACK but must not resurrect it.
+	late := &AppliedEvent{EventID: "L", Channel: "HOTLINE", SourceID: "C", Consent: []string{"CONTACT_CALLBACK"}, Person: Person{Phone: "999"}, CallbackWindowMinutes: ptr(20)}
+
+	v := Project("CR", []*AppliedEvent{grant, rev, late})
+	if v.ContactAvailable {
+		t.Fatalf("revoked scope must not be resurrected by a late re-grant")
+	}
+	if v.Person.Phone != "" {
+		t.Fatalf("withdrawn phone must remain redacted, got %q", v.Person.Phone)
+	}
+	if v.CallbackWindowMinutes != nil {
+		t.Fatalf("callback window must remain hidden after revocation")
+	}
+	// Un-revoked ACCOMMODATION_TRANSFER must remain intact.
+	if !v.AccommodationTransferable || len(v.Accommodations) != 1 || v.Accommodations[0] != "TEXT_ONLY" {
+		t.Fatalf("un-revoked scope must not be over-cleared: %+v", v)
+	}
+	// Replay stability.
+	v2 := Project("CR", []*AppliedEvent{grant, rev, late})
+	if v.ProjectionHash != v2.ProjectionHash {
+		t.Fatalf("replay must be stable")
+	}
+}
+
+func TestDuplicateRevocationIsIdempotent(t *testing.T) {
+	grant := &AppliedEvent{EventID: "G", Consent: []string{"CONTACT_CALLBACK", "CASE_SUMMARY_TRANSFER"}, Person: Person{FirstName: "I", LastName: "D", DateOfBirth: "1980-01-01", Email: "a@b.c"}, Summary: "secret"}
+	rev1 := &AppliedEvent{EventID: "R1", RevokesEventID: "G", RevocationScopes: []string{"CASE_SUMMARY_TRANSFER"}}
+	rev2 := &AppliedEvent{EventID: "R2", RevokesEventID: "G", RevocationScopes: []string{"CASE_SUMMARY_TRANSFER"}}
+	v := Project("CR", []*AppliedEvent{grant, rev1, rev2})
+	if v.SummaryTransferable {
+		t.Fatalf("summary transfer must be revoked")
+	}
+	if v.Summary != "" {
+		t.Fatalf("reversible summary must be cleared")
+	}
+	if !v.ContactAvailable {
+		t.Fatalf("CONTACT_CALLBACK was not revoked and must remain")
+	}
+}
+
+func ptr(n int) *int { return &n }

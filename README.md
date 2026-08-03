@@ -277,26 +277,46 @@ granted; evidence values for non-matching contacts are always masked.
   per-item verdict is committed together.
 - **Consent/callback projection**: `CONTACT_CALLBACK` gates phone, email and the
   callback window; `ACCOMMODATION_TRANSFER` gates the accommodation list;
-  `CASE_SUMMARY_TRANSFER` gates the free-text summary. Revocations remove
-  scopes immediately from the projection.
+  `CASE_SUMMARY_TRANSFER` gates the free-text summary. Revocations are applied
+  as **tombstones** (see below).
+- **Revocation tombstones and retained evidence**: the projection collects every
+  granted scope and every revoked scope. The effective set is
+  `granted - revoked`, so a scope that was once revoked can **never be
+  resurrected** by a later (or retried) event that re-grants it — for example a
+  late hotline retry carrying an already-withdrawn phone number will not
+  re-expose contact fields. Only the data gated by the **revoked** scope is
+  cleared (phone/email/callback for `CONTACT_CALLBACK`; the reversible summary
+  for `CASE_SUMMARY_TRANSFER`; the accommodation list for
+  `ACCOMMODATION_TRANSFER`). Other scopes are untouched. Legal, non-reversible
+  evidence is retained: the immutable event rows, per-item results, source
+  references, match evidence (with contact values masked unless matched),
+  event/audit chains and projection hashes all remain available.
+- **Idempotent revocation**: submitting the same `(eventId, payloadHash)`
+  revocation returns the original result without adding another event; revoking
+  the same scope more than once simply sets the same tombstone, so the result is
+  unchanged and replay-stable.
 
 ## Out-of-order, duplicate and concurrent events
 
 - **Out-of-order revocation**: events are replayed in a deterministic
   topological order. A revocation is projected immediately after the event it
-  references, even if it was persisted first. This keeps the final state stable
-  and replayable.
+  references, even if it was persisted first. The tombstone model makes the
+  final state independent of arrival order, so a revocation, a failed-then-
+  retried delivery and another channel's supplement can arrive in any order
+  without reviving withdrawn fields or over-clearing un-revoked scopes.
 - **Duplicates**: identical `(eventId, payloadHash)` returns the original
   result; no new event row, no new adapter call.
 - **Concurrency**: writes are serialized through a single SQLite connection
   with WAL + `busy_timeout`, and correlation is keyed by a stable
   `person_key` (hash of normalized name + DOB). Two channels reporting the same
-  applicant concurrently therefore resolve to **exactly one canonical request
-  and one event chain**. Explicit `canonicalRequestId` is honored when present.
+  applicant concurrently — including a revocation racing a supplement — resolve
+  to **exactly one canonical request and one event chain**, with the revoked
+  scope permanently withdrawn. Explicit `canonicalRequestId` is honored when
+  present.
 - **Failed retries never re-expose withdrawn data**: retries recompute the
   projection from the durable chain, so a `CONTACT_CALLBACK` revocation already
   on record means the adapter receives a view with phone/email/callback
-  redacted.
+  redacted even if the retried event itself carried that phone.
 
 ## Downstream adapter failures and retries
 
