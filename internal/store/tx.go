@@ -196,7 +196,7 @@ func (t *Tx) FindCanonicalByIdentity(ctx context.Context, ref, phoneDigits, emai
 // FindCandidatesByIdentity returns ALL canonical chains that match any of the
 // provided identifiers, ordered deterministically (oldest chain first). It is
 // used by the candidate matching engine to score every possible target.
-func (t *Tx) FindCandidatesByIdentity(ctx context.Context, ref, phoneDigits, email string) ([]*CanonicalRow, error) {
+func (t *Tx) FindCandidatesByIdentity(ctx context.Context, ref, phoneDigits, email, nameNorm string) ([]*CanonicalRow, error) {
 	var conds []string
 	var args []any
 	if ref != "" {
@@ -210,6 +210,10 @@ func (t *Tx) FindCandidatesByIdentity(ctx context.Context, ref, phoneDigits, ema
 	if email != "" {
 		conds = append(conds, "email = ?")
 		args = append(args, email)
+	}
+	if nameNorm != "" {
+		conds = append(conds, "lower(full_name) = ?")
+		args = append(args, nameNorm)
 	}
 	if len(conds) == 0 {
 		return nil, nil
@@ -359,22 +363,40 @@ func (t *Tx) AddAccommodation(ctx context.Context, canonicalID, eventID string, 
 	return err
 }
 
+// AddAccommodationGuarded records an accommodation only if the accommodations
+// field has not been revoked.
+func (t *Tx) AddAccommodationGuarded(ctx context.Context, canonicalID, eventID string, seq int, code string, revoked map[string]bool) error {
+	if IsFieldRevoked(revoked, "accommodations") {
+		return nil
+	}
+	return t.AddAccommodation(ctx, canonicalID, eventID, seq, code)
+}
+
 // UpdateCanonicalPerson updates non-empty person fields and the callback
 // window on the canonical header (latest-non-empty-wins), so later events can
 // supplement information from another channel. It also maintains the
 // phone_digits column used for deterministic candidate matching.
+//
+// Deprecated: use UpdateCanonicalPersonGuarded which respects revoked fields.
 func (t *Tx) UpdateCanonicalPerson(ctx context.Context, canonicalID, name, phone, email, ref string, callback *int) error {
-	if name != "" {
+	return t.UpdateCanonicalPersonGuarded(ctx, canonicalID, name, phone, email, ref, callback, nil)
+}
+
+// UpdateCanonicalPersonGuarded updates non-empty person fields but skips any
+// field present in the revoked set. This prevents a later event or idempotent
+// retry from repopulating PII that was cleared by a consent revocation.
+func (t *Tx) UpdateCanonicalPersonGuarded(ctx context.Context, canonicalID, name, phone, email, ref string, callback *int, revoked map[string]bool) error {
+	if name != "" && !IsFieldRevoked(revoked, "full_name") {
 		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET full_name=? WHERE id=?`, name, canonicalID); err != nil {
 			return err
 		}
 	}
-	if phone != "" {
+	if phone != "" && !IsFieldRevoked(revoked, "phone") {
 		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET phone=?, phone_digits=? WHERE id=?`, phone, digitsOnly(phone), canonicalID); err != nil {
 			return err
 		}
 	}
-	if email != "" {
+	if email != "" && !IsFieldRevoked(revoked, "email") {
 		if _, err := t.tx.ExecContext(ctx, `UPDATE canonical_requests SET email=? WHERE id=?`, strings.ToLower(strings.TrimSpace(email)), canonicalID); err != nil {
 			return err
 		}

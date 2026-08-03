@@ -160,6 +160,30 @@ func (s *Store) BuildSnapshot(ctx context.Context, canonicalID string, opts Snap
 	snap.Person = latestPerson
 	snap.CallbackWindowMinutes = latestCallback
 
+	// Load revoked fields. These were cleared at revocation time, but we
+	// re-check here as a safety net so that any stale or manually-added
+	// data cannot cause a revoked field to reappear.
+	revoked, err := s.RevokedFields(ctx, canonicalID)
+	if err != nil {
+		return snap, err
+	}
+	for f := range revoked {
+		snap.RevokedFields = append(snap.RevokedFields, f)
+	}
+	sort.Strings(snap.RevokedFields)
+	if revoked["phone"] {
+		snap.Person.Phone = ""
+	}
+	if revoked["email"] {
+		snap.Person.Email = ""
+	}
+	if revoked["full_name"] {
+		snap.Person.FullName = ""
+	}
+	if revoked["accommodations"] {
+		snap.Accommodations = nil
+	}
+
 	// Contact masking: without current CONTACT_CALLBACK consent, contact
 	// details are never projected into a response, even on idempotent retry.
 	if opts.RedactContacts {
@@ -237,6 +261,7 @@ func (s *Store) AuditSummary(ctx context.Context, canonicalID string) (canonical
 		LatestSequence:     snap.Sequence,
 		CurrentConsent:     snap.Consent,
 		Accommodations:     snap.Accommodations,
+		RevokedFields:      snap.RevokedFields,
 		Sources:            snap.Sources,
 	}
 

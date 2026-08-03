@@ -75,6 +75,7 @@ Tables:
 | `validation_errors` | Per-item error rows tied to an event and attempt. |
 | `callback_events` | Hotline callback projection: window classification, match status, confidence, contact-exposure decision. |
 | `match_candidates` | Every canonical chain evaluated during normalization, with rank, selected flag, score, reasons, and conflicts. |
+| `revoked_fields` | Fields cleared by consent revocation (prevents revival by later events or retries). |
 | `schema_migrations` | Applied migration versions. |
 
 ## API
@@ -198,13 +199,42 @@ a valid consent grant or callback window in the same submission.
   revocation event writes `REVOKE` records for the scopes named in `scopes`.
 - The effective consent set is rebuilt from the append-only
   `consent_records` log: the latest action per scope wins.
+- **Field-level revocation (scope → reversible fields):**
+
+  | Scope | Cleared on revocation |
+  |---|---|
+  | `CONTACT_CALLBACK` | `phone`, `email` |
+  | `CASE_SUMMARY_TRANSFER` | `full_name` |
+  | `ACCOMMODATION_TRANSFER` | `accommodations` (deleted) |
+
+  When a scope is revoked, the corresponding raw PII is cleared from both
+  `canonical_requests` and every non-revocation `events` row in the chain, and
+  the field is recorded in `revoked_fields`. Accommodation rows are deleted.
+  **Non-reversible evidence is always preserved**: event ID, channel, source
+  correlation handle, payload hash, sequence number, timestamps, and the
+  revocation event itself remain intact for audit.
+- **No over-clearing:** only the fields mapped to the revoked scope are
+  affected. Revoking `CASE_SUMMARY_TRANSFER` clears `full_name` but leaves
+  phone/email (governed by `CONTACT_CALLBACK`) and accommodations (governed by
+  `ACCOMMODATION_TRANSFER`) untouched.
+- **Revoked fields never revive:** `UpdateCanonicalPersonGuarded` and
+  `AddAccommodationGuarded` skip any field present in `revoked_fields`. A late
+  hotline retry carrying a revoked phone number, a web supplementation, or an
+  idempotent replay cannot repopulate the cleared data. `BuildSnapshot` also
+  re-checks `revoked_fields` as a safety net on every read.
 - **Contact details (phone, email) are projected into any response only when
   `CONTACT_CALLBACK` is currently granted.** When it is absent or has been
   revoked, `contactMasked: true` is returned and `phone`/`email` are empty.
-- **A retry can never re-expose withdrawn contact data.** An idempotent retry
-  returns the original event outcome but recomputes the canonical snapshot from
-  current state, so a later revocation remains in force regardless of how many
-  times the original event is retried.
+- **Duplicate revocation is idempotent:** submitting the same revocation
+  `eventId` with the same payload returns the original outcome with
+  `idempotentReplay: true`. The `REVOKE` consent record and `revoked_fields`
+  row use `INSERT OR IGNORE` so no duplicates are created.
+- **Cross-chain isolation:** a revocation targets the chain of its `revokes`
+  event ID; other applicants' chains are unaffected.
+- The fixture revocation `EV-W-002` (`revokes: "EV-W-001"`,
+  `scopes: ["CASE_SUMMARY_TRANSFER"]`) is handled exactly as above: `full_name`
+  is cleared, `EV-W-001`'s evidence remains, and phone/email/accommodations
+  stay intact.
 
 ## Concurrency: one event chain per applicant
 

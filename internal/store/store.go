@@ -171,6 +171,21 @@ CREATE TABLE IF NOT EXISTS match_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_callbacks_canonical ON callback_events(canonical_request_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_event ON match_candidates(event_id, rank);
+
+-- revoked_fields records which reversible PII fields have been cleared by a
+-- consent revocation. Once a field is revoked it cannot be repopulated by a
+-- later event or idempotent retry. Non-reversible evidence (event id,
+-- channel, source correlation, payload hash, sequence, timestamps) is
+-- preserved even for revoked fields.
+CREATE TABLE IF NOT EXISTS revoked_fields (
+  canonical_request_id TEXT NOT NULL REFERENCES canonical_requests(id),
+  field                TEXT NOT NULL,
+  revoked_by_event     TEXT NOT NULL,
+  revoked_at           TEXT NOT NULL,
+  PRIMARY KEY (canonical_request_id, field)
+);
+
+CREATE INDEX IF NOT EXISTS idx_revoked_canonical ON revoked_fields(canonical_request_id);
 `
 
 func (s *Store) migrate() error {

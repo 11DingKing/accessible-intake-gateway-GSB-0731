@@ -219,7 +219,7 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 			}
 		}
 
-		candidates, err := tx.FindCandidatesByIdentity(ctx, identity.ReferenceNumber, identity.PhoneDigits, identity.Email)
+		candidates, err := tx.FindCandidatesByIdentity(ctx, identity.ReferenceNumber, identity.PhoneDigits, identity.Email, identity.FullNameNorm)
 		if err != nil {
 			return nil, err
 		}
@@ -236,12 +236,20 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 		}
 		canonical.RankCandidates(scored)
 
+		// Auto-link to the highest-scoring candidate when it has a strong
+		// identifier match (score >= 80), OR when there is exactly one
+		// candidate with a name match (score >= 10) — this allows events
+		// after a PII-clearing revocation to still find their chain by
+		// name without risking ambiguous cross-person linkage.
 		selected := (*canonical.ScoredCandidate)(nil)
 		for i := range scored {
 			if scored[i].CanAutoLink() {
 				selected = &scored[i]
 				break
 			}
+		}
+		if selected == nil && len(scored) == 1 && scored[0].Score >= 10 {
+			selected = &scored[0]
 		}
 
 		if selected != nil {
@@ -252,11 +260,26 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 				matchStatus = canonical.MatchLinked
 			}
 		} else {
-			canonicalID = newCanonicalID()
-			if err := tx.CreateCanonical(ctx, canonicalID, subjectKey, s.contracts.Version()); err != nil {
+			// No strong candidate from identity matching. As a fallback,
+			// check whether a chain with the same subject_key already
+			// exists. This handles the case where PII columns were cleared
+			// by a revocation but the subject linkage remains (e.g. a late
+			// hotline retry carrying a revoked phone number must not create
+			// a second chain or violate the subject_key UNIQUE constraint).
+			existing, err := tx.FindCanonicalBySubject(ctx, subjectKey)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return nil, err
 			}
-			matchStatus = canonical.MatchPending
+			if existing != nil {
+				canonicalID = existing.ID
+				matchStatus = canonical.MatchLinked
+			} else {
+				canonicalID = newCanonicalID()
+				if err := tx.CreateCanonical(ctx, canonicalID, subjectKey, s.contracts.Version()); err != nil {
+					return nil, err
+				}
+				matchStatus = canonical.MatchPending
+			}
 		}
 	}
 
@@ -324,12 +347,33 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 				if err := tx.RevokeConsent(ctx, canonicalID, norm.EventID, seq, scope); err != nil {
 					return nil, err
 				}
+				for _, field := range canonical.FieldsForScope(scope) {
+					if canonical.IsAccommodationField(field) {
+						if err := tx.DeleteAccommodations(ctx, canonicalID); err != nil {
+							return nil, err
+						}
+					} else {
+						if err := tx.ClearCanonicalField(ctx, canonicalID, field); err != nil {
+							return nil, err
+						}
+						if err := tx.RedactEventField(ctx, canonicalID, field); err != nil {
+							return nil, err
+						}
+					}
+					if err := tx.RevokeField(ctx, canonicalID, field, norm.EventID); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	} else {
+		revoked, err := tx.RevokedFields(ctx, canonicalID)
+		if err != nil {
+			return nil, err
+		}
 		for _, code := range norm.Accommodations {
 			if s.contracts.IsAccommodation(code) {
-				if err := tx.AddAccommodation(ctx, canonicalID, norm.EventID, seq, code); err != nil {
+				if err := tx.AddAccommodationGuarded(ctx, canonicalID, norm.EventID, seq, code, revoked); err != nil {
 					return nil, err
 				}
 			}
@@ -341,9 +385,9 @@ func (s *Service) Submit(ctx context.Context, env canonical.EventEnvelope) (*can
 				}
 			}
 		}
-		if err := tx.UpdateCanonicalPerson(ctx, canonicalID,
+		if err := tx.UpdateCanonicalPersonGuarded(ctx, canonicalID,
 			norm.Person.FullName, norm.Person.Phone, norm.Person.Email,
-			norm.Person.ReferenceNumber, effectiveWindow); err != nil {
+			norm.Person.ReferenceNumber, effectiveWindow, revoked); err != nil {
 			return nil, err
 		}
 	}

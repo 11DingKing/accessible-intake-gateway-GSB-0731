@@ -228,6 +228,7 @@ type CanonicalSnapshot struct {
 	CreatedAt             time.Time    `json:"createdAt"`
 	UpdatedAt             time.Time    `json:"updatedAt"`
 	ContactMasked         bool         `json:"contactMasked"`
+	RevokedFields         []string     `json:"revokedFields,omitempty"`
 }
 
 // SubmissionResult is returned for every event POST (including idempotent replay).
@@ -260,6 +261,7 @@ type AuditSummary struct {
 	LatestSequence     int             `json:"latestSequence"`
 	CurrentConsent     []string        `json:"currentConsent"`
 	Accommodations     []string        `json:"accommodations"`
+	RevokedFields      []string        `json:"revokedFields,omitempty"`
 	Sources            []SourceRef     `json:"sources"`
 	Events             []EventAudit    `json:"events"`
 }
