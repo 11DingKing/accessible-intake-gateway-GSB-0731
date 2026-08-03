@@ -148,6 +148,31 @@ func stableHash(v any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// mergePerson fills empty fields of dst from src. The first value established
+// for each field wins, so a later fragment that conflicts on identity never
+// silently overwrites the canonical person; conflicts are recorded separately
+// through the identity-matching evidence.
+func mergePerson(dst *Person, src Person) {
+	if dst.FirstName == "" {
+		dst.FirstName = src.FirstName
+	}
+	if dst.LastName == "" {
+		dst.LastName = src.LastName
+	}
+	if dst.DateOfBirth == "" {
+		dst.DateOfBirth = src.DateOfBirth
+	}
+	if dst.Email == "" {
+		dst.Email = src.Email
+	}
+	if dst.Phone == "" {
+		dst.Phone = src.Phone
+	}
+	if dst.PreferredLanguage == "" {
+		dst.PreferredLanguage = src.PreferredLanguage
+	}
+}
+
 // DecodeEnvelope extracts a normalized envelope from raw channel JSON using
 // the channel contract field names, preserving source field naming.
 func DecodeEnvelope(raw []byte, c *contracts.Contracts) (*Envelope, []ItemResult, error) {
@@ -299,11 +324,17 @@ func Validate(env *Envelope, c *contracts.Contracts) []ItemResult {
 	env.Consent = validConsent
 
 	if env.CallbackWindowMinutes != nil {
-		if *env.CallbackWindowMinutes < 0 {
-			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemRejected, Code: "INVALID_CALLBACK_WINDOW", Message: "callback window must not be negative", Value: *env.CallbackWindowMinutes})
+		switch v := *env.CallbackWindowMinutes; {
+		case v < 0:
+			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemRejected, Code: "INVALID_CALLBACK_WINDOW", Message: "callback window must not be negative", Value: v})
 			env.CallbackWindowMinutes = nil
-		} else {
-			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemApplied, Value: *env.CallbackWindowMinutes})
+		case v == 0:
+			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemApplied, Code: "IMMEDIATE_CALLBACK", Message: "callback window of 0 means immediate callback", Value: v})
+		case v > MaxCallbackWindowMinutes:
+			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemRejected, Code: "CROSS_DAY_CALLBACK_WINDOW", Message: "callback window exceeds 24 hours (1440 minutes) and is not same-day", Value: v})
+			env.CallbackWindowMinutes = nil
+		default:
+			results = append(results, ItemResult{Field: "callbackWindowMinutes", Status: ItemApplied, Value: v})
 		}
 	}
 
@@ -421,9 +452,7 @@ func Project(requestID string, events []*AppliedEvent) *CanonicalView {
 		if e.CreatedAt.After(updatedAt) {
 			updatedAt = e.CreatedAt
 		}
-		if e.Person.FirstName != "" || e.Person.LastName != "" {
-			person = e.Person
-		}
+		mergePerson(&person, e.Person)
 		if e.SourceID != "" {
 			sourceRefs[e.Channel] = e.SourceID
 		}

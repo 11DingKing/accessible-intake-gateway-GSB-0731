@@ -378,3 +378,256 @@ func jsonReader(v any) *bytes.Reader {
 	b, _ := json.Marshal(v)
 	return bytes.NewReader(b)
 }
+
+func TestHotlineCallbackArrivesBeforeWebRecordMergesIntoOneChain(t *testing.T) {
+	h := newHarness(t)
+
+	// Hotline callback arrives first: only a phone fragment, no full identity.
+	r1, cb := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-CB-1", "channel": "HOTLINE", "callRef": "C-CB-1",
+		"caller":                map[string]any{"phone": "555-9000"},
+		"callbackWindowMinutes": 30,
+		"consent":               []string{"CONTACT_CALLBACK"},
+	})
+	if r1.StatusCode != 200 {
+		t.Fatalf("callback first submit: %d %v", r1.StatusCode, cb)
+	}
+	cbRID := asMap(t, cb["result"])["canonicalRequestId"].(string)
+	cbMatch := asMap(t, cb["match"])
+	if cbMatch["confidence"] != "none" {
+		t.Fatalf("first fragment should have no match confidence, got %v", cbMatch)
+	}
+	// The caller granted CONTACT_CALLBACK with a phone-only fragment, so the
+	// phone is available; it will be merged with the web identity later.
+
+	// Web record arrives later with full identity and the same normalized phone.
+	r2, w := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-W-CB-1", "channel": "WEB", "submissionId": "W-CB-1",
+		"applicant": map[string]any{"firstName": "Callback", "lastName": "Person", "dateOfBirth": "1992-09-09", "phone": "(555) 9000"},
+	})
+	if r2.StatusCode != 200 {
+		t.Fatalf("web submit: %d", r2.StatusCode)
+	}
+	wRID := asMap(t, w["result"])["canonicalRequestId"].(string)
+	if wRID != cbRID {
+		t.Fatalf("web record must merge into the earlier callback chain: %s vs %s", wRID, cbRID)
+	}
+	wMatch := asMap(t, w["match"])
+	if wMatch["confidence"] != "high" {
+		t.Fatalf("expected high confidence phone match, got %v", wMatch["confidence"])
+	}
+	if wMatch["reason"] != "PHONE_MATCH" {
+		t.Fatalf("expected PHONE_MATCH reason, got %v", wMatch["reason"])
+	}
+	// Exactly one chain for the applicant.
+	resp, view := h.get(t, "/api/v1/requests/"+wRID)
+	if resp.StatusCode != 200 {
+		t.Fatalf("get chain: %d", resp.StatusCode)
+	}
+	chain, _ := view["eventChain"].([]any)
+	if len(chain) != 2 {
+		t.Fatalf("expected a single 2-event chain, got %d", len(chain))
+	}
+	refs := asMap(t, view["sourceReferences"])
+	if refs["HOTLINE"] != "C-CB-1" || refs["WEB"] != "W-CB-1" {
+		t.Fatalf("source references must preserve both: %v", refs)
+	}
+}
+
+func TestPartialMatchWithConflictingFragmentRecordsConflictEvidence(t *testing.T) {
+	h := newHarness(t)
+	h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-CF-1", "channel": "HOTLINE", "callRef": "C-CF-1",
+		"caller":                map[string]any{"firstName": "Sam", "lastName": "Doe", "dateOfBirth": "1980-01-01", "phone": "555-1111"},
+		"callbackWindowMinutes": 20,
+		"consent":               []string{"CONTACT_CALLBACK"},
+	})
+	// Different DOB but same name: conflicting identity fragment.
+	_, o := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-W-CF-1", "channel": "WEB", "submissionId": "W-CF-1",
+		"applicant": map[string]any{"firstName": "Sam", "lastName": "Doe", "dateOfBirth": "1980-01-02", "phone": "555-1111"},
+	})
+	match := asMap(t, o["match"])
+	if match["confidence"] != "high" {
+		t.Fatalf("phone match should yield high confidence: %v", match)
+	}
+	if match["conflict"] != true {
+		t.Fatalf("conflicting DOB must be flagged as conflict evidence: %v", match)
+	}
+	// Evidence must not expose raw contact fields for the conflicting comparison.
+	evidence, _ := match["evidence"].([]any)
+	var sawDOBConflict bool
+	for _, e := range evidence {
+		em := e.(map[string]any)
+		if em["field"] == "dateOfBirth" && em["matched"] == false {
+			sawDOBConflict = true
+		}
+	}
+	if !sawDOBConflict {
+		t.Fatalf("expected a dateOfBirth conflict evidence entry: %v", evidence)
+	}
+}
+
+func TestCallbackWindowZeroNegativeAndCrossDayHandling(t *testing.T) {
+	h := newHarness(t)
+	person := map[string]any{"firstName": "Win", "lastName": "Dow", "dateOfBirth": "1970-07-07"}
+
+	_, zero := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-W-0", "channel": "HOTLINE", "callRef": "C-W-0",
+		"caller": person, "callbackWindowMinutes": 0, "consent": []string{"CONTACT_CALLBACK"},
+	})
+	zres := asMap(t, zero["result"])
+	if code := itemCode(zres, "callbackWindowMinutes"); code != "IMMEDIATE_CALLBACK" {
+		t.Fatalf("zero window should be IMMEDIATE_CALLBACK, got %q", code)
+	}
+
+	_, neg := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-W-N", "channel": "HOTLINE", "callRef": "C-W-N",
+		"caller": person, "callbackWindowMinutes": -10,
+	})
+	nres := asMap(t, neg["result"])
+	if code := itemCode(nres, "callbackWindowMinutes"); code != "INVALID_CALLBACK_WINDOW" {
+		t.Fatalf("negative window should be rejected, got %q", code)
+	}
+
+	_, cross := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-H-W-X", "channel": "HOTLINE", "callRef": "C-W-X",
+		"caller": person, "callbackWindowMinutes": 2000,
+	})
+	xres := asMap(t, cross["result"])
+	if code := itemCode(xres, "callbackWindowMinutes"); code != "CROSS_DAY_CALLBACK_WINDOW" {
+		t.Fatalf("cross-day window should be rejected, got %q", code)
+	}
+}
+
+func itemCode(res map[string]any, field string) string {
+	items, _ := res["itemResults"].([]any)
+	for _, it := range items {
+		m := it.(map[string]any)
+		if m["field"] == field && m["status"] == "rejected" {
+			if c, ok := m["code"].(string); ok {
+				return c
+			}
+		}
+		if m["field"] == field && m["status"] == "applied" {
+			if c, ok := m["code"].(string); ok {
+				return c
+			}
+			return "applied"
+		}
+	}
+	return ""
+}
+
+func TestDuplicateKeySamePayloadReturnsOriginalAndDifferentPayloadConflicts(t *testing.T) {
+	h := newHarness(t)
+	body := map[string]any{
+		"eventId": "EV-DUP-1", "channel": "WEB", "submissionId": "W-DUP-1",
+		"applicant": map[string]any{"firstName": "Dup", "lastName": "Key", "dateOfBirth": "1988-08-08"},
+	}
+	r1, o1 := h.post(t, "/api/v1/events", body)
+	r2, o2 := h.post(t, "/api/v1/events", body)
+	if r1.StatusCode != 200 || r2.StatusCode != 200 {
+		t.Fatalf("duplicate same payload should be 200, got %d %d", r1.StatusCode, r2.StatusCode)
+	}
+	seq1 := asMap(t, o1["result"])["sequence"]
+	seq2 := asMap(t, o2["result"])["sequence"]
+	if seq1 != seq2 {
+		t.Fatalf("duplicate must not create a new sequence: %v vs %v", seq1, seq2)
+	}
+	body["summary"] = "changed"
+	r3, o3 := h.post(t, "/api/v1/events", body)
+	if r3.StatusCode != 409 {
+		t.Fatalf("same key different payload must be 409, got %d", r3.StatusCode)
+	}
+	if o3["conflict"] != true {
+		t.Fatalf("expected conflict flag")
+	}
+}
+
+func TestContactNotExposedBeforeConsent(t *testing.T) {
+	h := newHarness(t)
+	// Fragment with phone but no CONTACT_CALLBACK.
+	_, o := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-NC-1", "channel": "HOTLINE", "callRef": "C-NC-1",
+		"caller":                map[string]any{"firstName": "No", "lastName": "Consent", "dateOfBirth": "1975-05-05", "phone": "555-2222"},
+		"callbackWindowMinutes": 15,
+	})
+	view := asMap(t, o["canonical"])
+	if view["contactAvailable"] != false {
+		t.Fatalf("contact must be unavailable without CONTACT_CALLBACK")
+	}
+	p := asMap(t, view["person"])
+	if phone, _ := p["phone"].(string); phone != "" {
+		t.Fatalf("phone must be redacted without consent: %v", p)
+	}
+}
+
+func TestConcurrentHotlineAndWebClaimSameApplicantSingleChain(t *testing.T) {
+	h := newHarness(t)
+	var wg sync.WaitGroup
+	ids := make([]string, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, o := h.post(t, "/api/v1/events", map[string]any{
+			"eventId": "EV-CC-H", "channel": "HOTLINE", "callRef": "C-CC",
+			"caller":                map[string]any{"firstName": "Con", "lastName": "Current", "dateOfBirth": "2001-01-01", "phone": "555-7777"},
+			"callbackWindowMinutes": 25,
+			"consent":               []string{"CONTACT_CALLBACK"},
+		})
+		ids[0] = asMap(t, o["result"])["canonicalRequestId"].(string)
+	}()
+	go func() {
+		defer wg.Done()
+		_, o := h.post(t, "/api/v1/events", map[string]any{
+			"eventId": "EV-CC-W", "channel": "WEB", "submissionId": "W-CC",
+			"applicant": map[string]any{"firstName": "Con", "lastName": "Current", "dateOfBirth": "2001-01-01", "phone": "555-7777"},
+		})
+		ids[1] = asMap(t, o["result"])["canonicalRequestId"].(string)
+	}()
+	wg.Wait()
+	if ids[0] != ids[1] {
+		t.Fatalf("concurrent claims must resolve to one chain: %s vs %s", ids[0], ids[1])
+	}
+	_, view := h.get(t, "/api/v1/requests/"+ids[0])
+	chain, _ := view["eventChain"].([]any)
+	if len(chain) != 2 {
+		t.Fatalf("expected 2-event chain, got %d: %v", len(chain), chain)
+	}
+}
+
+func TestAdapterFailureRecoveryKeepsSingleChain(t *testing.T) {
+	h := newHarness(t)
+	h.adapter.FailOnce()
+	r1, o1 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-AF-1", "channel": "HOTLINE", "callRef": "C-AF",
+		"caller":                map[string]any{"firstName": "A", "lastName": "F", "dateOfBirth": "1960-06-06", "phone": "555-3333"},
+		"callbackWindowMinutes": 40,
+		"consent":               []string{"CONTACT_CALLBACK"},
+	})
+	if r1.StatusCode != 202 {
+		t.Fatalf("expected 202 on adapter failure, got %d", r1.StatusCode)
+	}
+	rid := asMap(t, o1["result"])["canonicalRequestId"].(string)
+	// A web event for the same person arrives while the first delivery is pending.
+	r2, o2 := h.post(t, "/api/v1/events", map[string]any{
+		"eventId": "EV-AF-2", "channel": "WEB", "submissionId": "W-AF",
+		"applicant": map[string]any{"firstName": "A", "lastName": "F", "dateOfBirth": "1960-06-06"},
+	})
+	if r2.StatusCode != 200 {
+		t.Fatalf("web event after failure: %d", r2.StatusCode)
+	}
+	if asMap(t, o2["result"])["canonicalRequestId"].(string) != rid {
+		t.Fatalf("web event must stay on the same chain after adapter failure")
+	}
+	// Retry the first delivery; projection must already include both events.
+	r3, o3 := h.post(t, "/api/v1/events/EV-AF-1/retry", map[string]any{})
+	if r3.StatusCode != 200 {
+		t.Fatalf("retry: %d %v", r3.StatusCode, o3)
+	}
+	chain, _ := asMap(t, o3["canonical"])["eventChain"].([]any)
+	if len(chain) != 2 {
+		t.Fatalf("retried projection must contain both events, got %v", chain)
+	}
+}

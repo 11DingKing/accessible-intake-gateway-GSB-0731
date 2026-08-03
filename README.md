@@ -178,6 +178,82 @@ window, event chain and a stable `projectionHash`.
 }
 ```
 
+### `GET /api/v1/events/{eventId}/match` — identity-match rationale
+
+Returns the deterministic match decision that attached an event to its
+canonical request: `confidence` (`exact`/`high`/`medium`/`low`/`none`),
+machine-readable `reason`, numeric `score`, a `conflict` flag, and per-field
+`evidence`. Contact values in evidence are masked unless the field itself is a
+confirmed match. Reasons include `EXACT_IDENTITY`, `PHONE_MATCH`,
+`EMAIL_MATCH`, `NAME_DOB_PARTIAL_MATCH`, `CROSS_CHANNEL_LINK`,
+`FRAGMENT_CONFLICT` and `NO_MATCH`.
+
+### `GET /api/v1/requests?status=pending` — list fragment-only pending candidates
+
+Lists canonical requests created from partial identity fragments (e.g. a
+hotline callback that arrived before the web record) that have not yet been
+confirmed by a complete identity.
+
+## Hotline callback events and identity resolution
+
+A hotline **callback event** is a `HOTLINE` channel event carrying
+`callbackWindowMinutes`. It may arrive **before** the web/physical record
+exists, and may carry only an identity **fragment** (for example just a phone
+number) or a fragment that partly matches and partly conflicts with an existing
+request (same name/phone, different DOB).
+
+`callbackWindowMinutes` continues to use the minute unit from the first round.
+It is validated item-by-item:
+
+| Value  | Code / result                                                        |
+|--------|---------------------------------------------------------------------|
+| absent | no callback window contribution                                      |
+| `0`    | applied as `IMMEDIATE_CALLBACK` (call immediately)                   |
+| `< 0`  | rejected as `INVALID_CALLBACK_WINDOW`; window dropped                |
+| `> 1440` | rejected as `CROSS_DAY_CALLBACK_WINDOW` (same-day window exceeded)  |
+| `1..1440` | applied as a same-day callback window in minutes                   |
+
+### Deterministic matching
+
+Each event contributes an identity fragment. When a new event is submitted the
+resolver looks, in order, at:
+
+1. explicit `canonicalRequestId`;
+2. exact identity (`firstName` + `lastName` + `dateOfBirth`) → `exact`;
+3. strong-identifier match on normalized **phone** or **email** across stored
+   fragments → `high`;
+4. name/partial-DOB matches → `medium`;
+5. no shared signal → a new `pending` candidate.
+
+When multiple candidates match, the highest score wins, with the lowest
+`requestId` as the deterministic tie-breaker. Conflicting fields (e.g. a
+matching phone but a different DOB) are recorded as conflict evidence but do
+**not** silently overwrite the canonical person; the first-established value for
+each field wins in the projection, and the conflict is surfaced in `match` and
+`GET .../match`.
+
+If the strong-identifier match is `exact`/`high`, the event is attached to the
+existing request automatically. When a later full-identity event arrives, all
+matching pending candidates are consolidated into that single chain. Original
+contact data is never exposed in projections until `CONTACT_CALLBACK` is
+granted; evidence values for non-matching contacts are always masked.
+
+### One chain under out-of-order, concurrent and failure scenarios
+
+- **Out-of-order arrival**: a phone-only hotline callback first creates a
+  `pending` request. The later web event matches by normalized phone and merges
+  into that same request; only one `canonicalRequestId` and one event chain
+  result.
+- **Two channels concurrently claim the same applicant**: writes are serialized
+  through one SQLite connection (WAL + `busy_timeout`); the second transaction
+  sees the first's fragment and matches into the same request instead of
+  creating another.
+- **Adapter transient failure followed by recovery**: the failed event stays on
+  its chain with `deliveryStatus=pending`; a subsequent same-person event and a
+  later `/retry` both operate on that same chain, and the retried projection
+  already contains every event (and any revocation) recorded so far. A retry can
+  never re-expose a contact channel whose consent was withdrawn.
+
 ## Idempotency, conflicts and per-item transaction semantics
 
 - **Idempotency key** = `eventId`. Each event is also fingerprinted with a

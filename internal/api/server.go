@@ -21,6 +21,7 @@ type Server struct {
 type submitResponse struct {
 	Result      *intake.EventResult   `json:"result"`
 	Canonical   *intake.CanonicalView `json:"canonical,omitempty"`
+	Match       intake.MatchDecision  `json:"match,omitempty"`
 	Conflict    bool                  `json:"conflict,omitempty"`
 	ConflictMsg string                `json:"conflictMessage,omitempty"`
 }
@@ -44,11 +45,30 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/events", s.HandleSubmit)
 	mux.HandleFunc("/api/v1/events/", s.HandleEvent)
+	mux.HandleFunc("/api/v1/requests", s.HandleRequests)
 	mux.HandleFunc("/api/v1/requests/", s.HandleRequest)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	return mux
+}
+
+func (s *Server) HandleRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status == "pending" {
+		pending, err := s.Store.PendingRequests()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "pending", "requestIds": pending})
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, errorResponse{Error: "use ?status=pending to list pending candidates"})
 }
 
 func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +117,7 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if outcome.Conflict {
 		writeJSON(w, http.StatusConflict, submitResponse{
-			Result: outcome.Result, Canonical: outcome.Projection,
+			Result: outcome.Result, Canonical: outcome.Projection, Match: outcome.Match,
 			Conflict: true, ConflictMsg: outcome.ConflictDetail,
 		})
 		return
@@ -106,7 +126,7 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	if outcome.Result.Status == intake.StatusAdapterFailure {
 		code = http.StatusAccepted
 	}
-	writeJSON(w, code, submitResponse{Result: outcome.Result, Canonical: outcome.Projection})
+	writeJSON(w, code, submitResponse{Result: outcome.Result, Canonical: outcome.Projection, Match: outcome.Match})
 }
 
 func (s *Server) HandleEvent(w http.ResponseWriter, r *http.Request) {
@@ -117,26 +137,48 @@ func (s *Server) HandleEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eventID := parts[0]
-	if len(parts) == 2 && parts[1] == "retry" {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "retry":
+			if r.Method != http.MethodPost {
+				writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+				return
+			}
+			res, view, err := s.Store.RetryDelivery(eventID, s.Adapter)
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, errorResponse{Error: "event not found"})
+				return
+			}
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+				return
+			}
+			code := http.StatusOK
+			if res.DeliveryStatus == intake.DeliveryPending {
+				code = http.StatusAccepted
+			}
+			writeJSON(w, code, submitResponse{Result: res, Canonical: view})
+			return
+		case "match":
+			if r.Method != http.MethodGet {
+				writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+				return
+			}
+			m, err := s.Store.MatchForEvent(eventID)
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, errorResponse{Error: "event not found"})
+				return
+			}
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, m)
+			return
+		default:
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "not found"})
 			return
 		}
-		res, view, err := s.Store.RetryDelivery(eventID, s.Adapter)
-		if errors.Is(err, store.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, errorResponse{Error: "event not found"})
-			return
-		}
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
-			return
-		}
-		code := http.StatusOK
-		if res.DeliveryStatus == intake.DeliveryPending {
-			code = http.StatusAccepted
-		}
-		writeJSON(w, code, submitResponse{Result: res, Canonical: view})
-		return
 	}
 	if len(parts) != 1 {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "not found"})
