@@ -1,0 +1,18 @@
+{
+  "canonicalVersion": "intake.v1",
+  "accommodationCodes": ["BRAILLE_MATERIAL", "SIGN_INTERPRETER", "TEXT_ONLY", "STEP_FREE_ACCESS"],
+  "consentScopes": ["CONTACT_CALLBACK", "CASE_SUMMARY_TRANSFER", "ACCOMMODATION_TRANSFER"],
+  "channels": {
+    "PHYSICAL": {"sourceIdField": "deskReceiptNo", "personField": "visitor"},
+    "HOTLINE": {"sourceIdField": "callRef", "personField": "caller", "callbackWindowField": "callbackWindowMinutes"},
+    "WEB": {"sourceIdField": "submissionId", "personField": "applicant"}
+  },
+  "examples": [
+    {"eventId": "EV-P-001", "channel": "PHYSICAL", "deskReceiptNo": "D-88", "accommodations": ["BRAILLE_MATERIAL"]},
+    {"eventId": "EV-H-001", "channel": "HOTLINE", "callRef": "C-19", "callbackWindowMinutes": 45, "consent": ["CONTACT_CALLBACK"]},
+    {"eventId": "EV-W-001", "channel": "WEB", "submissionId": "W-71", "consent": ["CASE_SUMMARY_TRANSFER", "ACCOMMODATION_TRANSFER"]}
+  ],
+  "revocation": {"eventId": "EV-W-002", "revokes": "EV-W-001", "scopes": ["CASE_SUMMARY_TRANSFER"]},
+  "invalidCases": ["negative callbackWindowMinutes", "unknown accommodation code", "same eventId with different payload"]
+}
+
